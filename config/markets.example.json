@@ -1,0 +1,23 @@
+{
+  "markets": [
+    {
+      "partition": 0,
+      "depth": 20,
+      "definition": {
+        "sourceMarketId": 7,
+        "definitionVersion": "3",
+        "market": {
+          "marketId": "BTC-USDT",
+          "baseAsset": "BTC",
+          "quoteAsset": "USDT",
+          "baseAssetScale": 8,
+          "quoteAssetScale": 6,
+          "priceScale": 2,
+          "priceTickUnits": "25",
+          "quantityStepBaseAtoms": "1000",
+          "status": "MARKET_STATUS_ACTIVE"
+        }
+      }
+    }
+  ]
+}
