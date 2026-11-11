@@ -23,6 +23,8 @@ import (
 	md "github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/marketdata/v1alpha1"
 	matching "github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/matching/v1alpha1"
 	order "github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/order/v1alpha1"
+	"github.com/MeowMeowOrganization/meow-market-data/internal/marketregistry"
+	rediscache "github.com/MeowMeowOrganization/meow-market-data/internal/storage/redis"
 	"github.com/gorilla/websocket"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/redis/go-redis/v9"
@@ -42,25 +44,28 @@ const (
 )
 
 type checker struct {
-	ctx     context.Context
-	db      *sql.DB
-	redis   *redis.Client
-	kafka   *kgo.Client
-	topic   string
-	httpURL string
-	rpc     apiv1alpha1connect.MarketDataServiceClient
+	ctx            context.Context
+	db             *sql.DB
+	redis          *redis.Client
+	kafka          *kgo.Client
+	topic          string
+	httpURL        string
+	redisPrefix    string
+	redisNamespace rediscache.Namespace
+	rpc            apiv1alpha1connect.MarketDataServiceClient
 }
 
 func main() {
-	phase := flag.String("phase", "live", "live or recovery")
+	phase := flag.String("phase", "live", "live, recovery, outage, or restored")
 	dsn := flag.String("dsn", "", "isolated PostgreSQL database URL")
 	redisURL := flag.String("redis", "", "isolated Redis URL")
 	brokers := flag.String("brokers", "127.0.0.1:9094", "Kafka bootstrap brokers")
 	topic := flag.String("topic", "", "fresh one-partition matching-result topic")
+	epoch := flag.String("redis-epoch", "1", "Redis cache projection generation; matches service configuration")
 	httpURL := flag.String("http", "http://127.0.0.1:18090", "running market-data listener")
 	flag.Parse()
-	if *dsn == "" || *redisURL == "" || *topic == "" || (*phase != "live" && *phase != "recovery") {
-		log.Fatal("--phase live|recovery, --dsn, --redis, and --topic are required")
+	if *dsn == "" || *redisURL == "" || *topic == "" || (*phase != "live" && *phase != "recovery" && *phase != "outage" && *phase != "restored") {
+		log.Fatal("--phase live|recovery|outage|restored, --dsn, --redis, and --topic are required")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -69,21 +74,35 @@ func main() {
 	defer db.Close()
 	opts, err := redis.ParseURL(*redisURL)
 	must(err)
+	namespace, err := rediscache.NewNamespace(*topic, *epoch)
+	must(err)
 	rdb := redis.NewClient(opts)
 	defer rdb.Close()
 	producer, err := kgo.NewClient(kgo.SeedBrokers(strings.Split(*brokers, ",")...))
 	must(err)
 	defer producer.Close()
 	must(db.PingContext(ctx))
-	must(rdb.Ping(ctx).Err())
+	if *phase != "outage" {
+		must(rdb.Ping(ctx).Err())
+	}
 	must(producer.Ping(ctx))
 	c := &checker{ctx: ctx, db: db, redis: rdb, kafka: producer, topic: *topic,
-		httpURL: strings.TrimRight(*httpURL, "/"),
-		rpc:     apiv1alpha1connect.NewMarketDataServiceClient(&http.Client{Timeout: 8 * time.Second}, strings.TrimRight(*httpURL, "/"))}
-	if *phase == "live" {
+		httpURL:        strings.TrimRight(*httpURL, "/"),
+		redisPrefix:    namespace.MarketPrefix(sourceID, definition),
+		redisNamespace: namespace,
+		rpc:            apiv1alpha1connect.NewMarketDataServiceClient(&http.Client{Timeout: 8 * time.Second}, strings.TrimRight(*httpURL, "/"))}
+	switch *phase {
+	case "live":
 		must(c.live())
-	} else {
+	case "recovery":
 		must(c.recovery())
+	case "outage":
+		must(c.pgState(3))
+		must(c.wait("Connect PostgreSQL fallback while Redis is down", func() error { return c.rpcState(3) }))
+	case "restored":
+		must(c.wait("Redis periodic cache restored after outage", func() error { return c.redisState(3) }))
+		must(c.wait("Redis live L2 restored after outage", func() error { return c.liveRedisState(3) }))
+		must(c.rpcState(3))
 	}
 	fmt.Println("PASS: phase", *phase)
 }
@@ -205,6 +224,19 @@ func (c *checker) pgState(wantSeq uint64) error {
 		return fmt.Errorf("candle revision count=%d: %v", candleRevisions, err)
 	}
 	if wantSeq >= 2 {
+		var count, base, quote string
+		err = c.db.QueryRowContext(c.ctx, `SELECT coalesce(sum(trade_count),0)::text,
+          coalesce(sum(base_volume_atoms),0)::text,coalesce(sum(quote_volume_atoms),0)::text
+          FROM market_data.trade_minute_rollups WHERE topic=$1 AND source_market_id=7`, c.topic).Scan(&count, &base, &quote)
+		wantBase := uint64(2000)
+		if wantSeq == 3 {
+			wantBase = 3000
+		}
+		if err != nil || count != fmt.Sprint(wantSeq-1) || base != fmt.Sprint(wantBase) || quote != fmt.Sprint(wantBase) {
+			return fmt.Errorf("minute rollup count=%s base=%s quote=%s: %v", count, base, quote, err)
+		}
+	}
+	if wantSeq >= 2 {
 		var id, quoteAtoms string
 		err = c.db.QueryRowContext(c.ctx, `SELECT trade_id,quote_atoms::text FROM market_data.public_trades
 			WHERE topic=$1 AND source_market_id=7 AND market_sequence=2 AND event_ordinal=0`, c.topic).Scan(&id, &quoteAtoms)
@@ -227,7 +259,7 @@ func checkBook(s *md.BookSnapshot, seq uint64) error {
 }
 
 func (c *checker) redisState(seq uint64) error {
-	prefix := "md:v1:m:{7}:"
+	prefix := c.redisPrefix
 	stored, err := c.redis.HGet(c.ctx, prefix+"state", "sequence").Result()
 	if err != nil || stored != strconv.FormatUint(seq, 10) {
 		return fmt.Errorf("Redis sequence %q want %d: %v", stored, seq, err)
@@ -279,6 +311,18 @@ func (c *checker) redisState(seq uint64) error {
 		}
 	}
 	return nil
+}
+
+// liveRedisState checks the independently sequenced CEX24.2 book, not the
+// periodic full-bundle state used by ticker/trades/stats.
+func (c *checker) liveRedisState(seq uint64) error {
+	m := marketregistry.Market{SourceID: sourceID, Symbol: marketSymbol, DefinitionVersion: definition,
+		Depth: 20, PriceTickUnits: 25, QuantityStepAtoms: 1000}
+	live, err := rediscache.LoadLiveBook(c.ctx, c.redis, c.redisNamespace, m, time.Now().UTC(), true)
+	if err != nil {
+		return err
+	}
+	return checkBook(live.Snapshot, seq)
 }
 
 func (c *checker) rpcState(seq uint64) error {
@@ -488,6 +532,9 @@ func (c *checker) live() error {
 	if err := c.wait("Redis seq=1", func() error { return c.redisState(1) }); err != nil {
 		return err
 	}
+	if err := c.wait("Redis live L2 seq=1", func() error { return c.liveRedisState(1) }); err != nil {
+		return err
+	}
 	if err := c.wait("Connect book seq=1", func() error { return c.rpcState(1) }); err != nil {
 		return err
 	}
@@ -506,6 +553,9 @@ func (c *checker) live() error {
 		return err
 	}
 	if err = c.wait("Redis coherent caches seq=2", func() error { return c.redisState(2) }); err != nil {
+		return err
+	}
+	if err := c.wait("Redis incremental live L2 seq=2", func() error { return c.liveRedisState(2) }); err != nil {
 		return err
 	}
 	return c.wait("all five Connect RPCs seq=2", func() error { return c.rpcState(2) })
@@ -535,6 +585,9 @@ func (c *checker) recovery() error {
 	if err := c.wait("Redis caches seq=3", func() error { return c.redisState(3) }); err != nil {
 		return err
 	}
+	if err := c.wait("Redis incremental live L2 seq=3", func() error { return c.liveRedisState(3) }); err != nil {
+		return err
+	}
 	if err := c.wait("all five Connect RPCs seq=3", func() error { return c.rpcState(3) }); err != nil {
 		return err
 	}
@@ -546,5 +599,8 @@ func (c *checker) recovery() error {
 	if err := c.wait("Connect remains available after Redis cache eviction", func() error { return c.rpcState(3) }); err != nil {
 		return err
 	}
-	return c.wait("Redis full recovery from PostgreSQL", func() error { return c.redisState(3) })
+	if err := c.wait("Redis full cache recovery from PostgreSQL", func() error { return c.redisState(3) }); err != nil {
+		return err
+	}
+	return c.wait("Redis live L2 recovery after FlushDB", func() error { return c.liveRedisState(3) })
 }

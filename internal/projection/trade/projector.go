@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"math/big"
 
+	"github.com/MeowMeowOrganization/meow-contracts/tradeid"
+
 	marketdatav1 "github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/marketdata/v1alpha1"
 	matchingv1 "github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/matching/v1alpha1"
 	orderv1 "github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/order/v1alpha1"
@@ -16,11 +18,13 @@ import (
 var ErrUnrepresentable = errors.New("trade: unrepresentable exact amount")
 var maxUint64 = new(big.Int).SetUint64(^uint64(0))
 
-// ID is a deterministic canonicalization proposal of MatchingEventId.
-// Verify it matches the existing Order Service / Accounting formatter before
-// connecting to the real publisher; protobuf contracts do not specify text ID.
+// ID is the v1 cross-service canonical matching execution identity.
 func ID(marketID uint32, sequence, ordinal uint64) string {
-	return fmt.Sprintf("%d:%d:%d", marketID, sequence, ordinal)
+	id, err := tradeid.Format(marketID, sequence, ordinal)
+	if err != nil {
+		return ""
+	}
+	return id
 }
 
 func Project(input *matchingv1.CommittedMatchingResult, def *marketdatav1.MarketProjectionDefinition) ([]*marketdatav1.TradeTick, error) {

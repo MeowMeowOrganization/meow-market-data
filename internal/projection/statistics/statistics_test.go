@@ -31,7 +31,7 @@ func TestRollingWindowBoundsAndSignedBPS(t *testing.T) {
 		t.Fatal("exclusive window start accepted")
 	}
 	rows := []*md.TradeTick{tick(1, 0, 200, 3, 9, start.Add(time.Nanosecond)), tick(2, 0, 150, 4, 11, asOf)}
-	s, err := Stats24h("BTC-USDT", asOf, rows)
+	s, err := Stats24h("BTC-USDT", asOf, rows, 200)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,5 +48,18 @@ func TestCandleIntervalBoundary(t *testing.T) {
 	_, err := Candle("BTC-USDT", md.CandleInterval_CANDLE_INTERVAL_ONE_MINUTE, start, []*md.TradeTick{tick(1, 0, 10, 1, 1, start.Add(time.Minute))}, 0)
 	if err == nil {
 		t.Fatal("included exclusive end")
+	}
+}
+
+func TestPercentageChangeUsesStrictHistoricalReference(t *testing.T) {
+	now := time.Date(2026, 11, 11, 12, 0, 0, 0, time.UTC)
+	ticks := []*md.TradeTick{tick(1, 0, 150, 2, 3, now.Add(-time.Hour)), tick(2, 0, 200, 2, 3, now)}
+	noRef, e := Stats24h("BTC-USDT", now, ticks)
+	if e != nil || noRef.GetPriceChangeBps() != "" {
+		t.Fatalf("fabricated missing reference: %v %v", noRef, e)
+	}
+	ref, e := Stats24h("BTC-USDT", now, ticks, 100)
+	if e != nil || ref.GetOpenPriceUnits() != 150 || ref.GetClosePriceUnits() != 200 || ref.GetPriceChangeBps() != "10000" {
+		t.Fatalf("wrong cutoff reference: %v %v", ref, e)
 	}
 }

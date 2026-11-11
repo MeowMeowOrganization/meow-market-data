@@ -16,6 +16,7 @@ import (
 	"github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/api/v1alpha1/apiv1alpha1connect"
 	"github.com/MeowMeowOrganization/meow-market-data/internal/bootstrap"
 	"github.com/MeowMeowOrganization/meow-market-data/internal/consumer/kafka"
+	"github.com/MeowMeowOrganization/meow-market-data/internal/livebook"
 	"github.com/MeowMeowOrganization/meow-market-data/internal/marketregistry"
 	"github.com/MeowMeowOrganization/meow-market-data/internal/publicapi"
 	"github.com/MeowMeowOrganization/meow-market-data/internal/readmodel"
@@ -56,14 +57,23 @@ func run(logger *slog.Logger) error {
 	cancelPing()
 	// Fail at startup instead of checkpointing new matching results without
 	// the transactional candle revision journal introduced by CEX23.6.
-	var hasJournal, hasFloor bool
+	var hasJournal, hasFloor, hasMinuteRollups, hasProvenance, hasWatermarks bool
 	if err := db.QueryRowContext(ctx, `SELECT
         to_regclass('market_data.candle_updates') IS NOT NULL,
-        to_regclass('market_data.stream_replay_floors') IS NOT NULL`).Scan(&hasJournal, &hasFloor); err != nil {
+        to_regclass('market_data.stream_replay_floors') IS NOT NULL,
+        to_regclass('market_data.trade_minute_rollups') IS NOT NULL,
+        to_regclass('market_data.matching_result_provenance') IS NOT NULL,
+        to_regclass('market_data.market_event_watermarks') IS NOT NULL`).Scan(&hasJournal, &hasFloor, &hasMinuteRollups, &hasProvenance, &hasWatermarks); err != nil {
 		return err
 	}
 	if !hasJournal || !hasFloor {
 		return errors.New("CEX23.6 requires migration 000003_stream_candles.sql")
+	}
+	if !hasMinuteRollups {
+		return errors.New("CEX24.3 requires migration 000004_trade_minute_rollups.sql (stop consumer and backfill first)")
+	}
+	if !hasProvenance || !hasWatermarks {
+		return errors.New("CEX25.2 requires migration 000005_cex25_finality_provenance.sql")
 	}
 	store, err := postgres.New(db)
 	if err != nil {
@@ -77,13 +87,13 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	cache, err := rediscache.New(cfg.RedisURL)
+	cache, err := rediscache.New(cfg.RedisURL, cfg.Topic, cfg.RedisProjectionEpoch)
 	if err != nil {
 		return err
 	}
 	defer cache.Close()
 
-	source := &stream.PostgresSource{DB: db, Topic: cfg.Topic, Cache: cache.Client}
+	source := &stream.PostgresSource{DB: db, Topic: cfg.Topic, Cache: cache.Client, CacheNamespace: cache.Namespace}
 	hub, err := stream.NewHub(runCtx, source, cfg.StreamPollInterval, cfg.StreamSoftInterval, 256)
 	if err != nil {
 		return err
@@ -93,14 +103,16 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	wsHandler.Shutdown = runCtx.Done()
-	rpc, err := publicapi.NewService(registry, &publicapi.Repository{DB: db, Topic: cfg.Topic, Cache: cache.Client}, []byte(cfg.CursorSecret))
+	rpc, err := publicapi.NewService(registry, &publicapi.Repository{DB: db, Topic: cfg.Topic, Cache: cache.Client, CacheNamespace: cache.Namespace}, []byte(cfg.CursorSecret))
 	if err != nil {
 		return err
 	}
+	monitor := kafka.NewSourceMonitor(db, cfg.Topic)
 	mux := http.NewServeMux()
 	prefix, connectHandler := apiv1alpha1connect.NewMarketDataServiceHandler(rpc, connect.WithReadMaxBytes(64<<10), connect.WithSendMaxBytes(4<<20))
 	mux.Handle(prefix, connectHandler)
 	mux.Handle("/v1/market-data/stream", wsHandler)
+	mux.HandleFunc("/source-healthz", monitor.Handler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
 		checkCtx, stop := context.WithTimeout(r.Context(), 2*time.Second)
@@ -133,14 +145,27 @@ func run(logger *slog.Logger) error {
 	}()
 
 	ids := make([]uint32, 0, len(cfg.Markets))
+	markets := make([]marketregistry.Market, 0, len(cfg.Markets))
 	for _, m := range cfg.Markets {
 		ids = append(ids, m.Definition.GetSourceMarketId())
+		market, ok := registry.ByID(m.Definition.GetSourceMarketId())
+		if !ok {
+			return errors.New("livebook: configured market missing from registry")
+		}
+		markets = append(markets, market)
 	}
 	go func() {
 		_ = readmodel.Run(runCtx, &readmodel.Reader{DB: db, Topic: cfg.Topic}, cache, ids, cfg.RedisRefreshInterval, logger)
 	}()
+	go func() {
+		projector := &livebook.Worker{
+			Journal: &livebook.PostgresJournal{DB: db, Topic: cfg.Topic},
+			Cache:   livebook.RedisAdapter{Cache: cache}, Markets: markets,
+		}
+		_ = projector.Run(runCtx, cfg.RedisBookPollInterval, logger)
+	}()
 	logger.Info("market-data started", "http", cfg.HTTPAddr, "topic", cfg.Topic, "group", cfg.Group, "markets", len(ids))
-	err = kafka.Run(runCtx, kafka.Config{Brokers: cfg.Brokers, Topic: cfg.Topic, Group: cfg.Group, ClientID: cfg.ClientID}, worker)
+	err = kafka.Run(runCtx, kafka.Config{Brokers: cfg.Brokers, Topic: cfg.Topic, Group: cfg.Group, ClientID: cfg.ClientID, Monitor: monitor}, worker)
 	select {
 	case httpErr := <-httpErrors:
 		return httpErr

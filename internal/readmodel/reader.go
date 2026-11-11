@@ -12,7 +12,6 @@ import (
 
 	md "github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/marketdata/v1alpha1"
 	"github.com/MeowMeowOrganization/meow-market-data/internal/projection/statistics"
-	"github.com/MeowMeowOrganization/meow-market-data/internal/storage/postgres"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -154,14 +153,7 @@ func (r *Reader) Load(ctx context.Context, id uint32, asOf time.Time) (_ *Bundle
 		}
 		b.Candles[interval] = candles
 	}
-	start := asOf.Add(-24 * time.Hour)
-	window, err := readTicks(ctx, tx, `SELECT payload FROM market_data.public_trades
-        WHERE topic=$1 AND source_market_id=$2 AND recorded_at_ns>$3 AND recorded_at_ns<=$4
-        ORDER BY market_sequence,event_ordinal`, r.Topic, int64(id), postgres.NanosDecimal(start), postgres.NanosDecimal(asOf))
-	if err != nil {
-		return nil, err
-	}
-	b.Stats, err = statistics.Stats24h(snap.GetMarketId(), asOf, window)
+	b.Stats, err = loadStats(ctx, tx, r.Topic, id, snap.GetMarketId(), asOf)
 	if err != nil {
 		return nil, err
 	}

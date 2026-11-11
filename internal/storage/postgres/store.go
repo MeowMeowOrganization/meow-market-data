@@ -14,6 +14,9 @@ import (
 	"fmt"
 	"math"
 
+	matching "github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/matching/v1alpha1"
+	"google.golang.org/protobuf/proto"
+
 	"github.com/MeowMeowOrganization/meow-market-data/internal/recovery"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
@@ -99,6 +102,14 @@ func (s *Store) Acquire(ctx context.Context, part recovery.Partition) (recovery.
 	return a, nil
 }
 
+// ProvenanceDigest fetches the immutable accepted envelope digest. Missing
+// history is NOT accepted as an idempotent duplicate (requires audited replay).
+func (s *Store) ProvenanceDigest(ctx context.Context, part recovery.Partition, marketID uint32, sequence uint64) ([]byte, error) {
+	var digest []byte
+	err := s.DB.QueryRowContext(ctx, `SELECT payload_sha256 FROM market_data.matching_result_provenance WHERE topic=$1 AND source_market_id=$2 AND market_sequence=$3`, part.Topic, int64(marketID), fmt.Sprint(sequence)).Scan(&digest)
+	return digest, err
+}
+
 // Save is one PostgreSQL TX per matching result, with a row-lock and
 // (owner token, next offset) compare-and-swap precondition. A stale owner and
 // an offset hole cannot overwrite another worker's checkpoint.
@@ -124,6 +135,42 @@ func (s *Store) Save(ctx context.Context, part recovery.Partition, token string,
 	}
 	if current != expectedOffset {
 		return fmt.Errorf("%w: expected=%d persisted=%d", ErrCursor, expectedOffset, current)
+	}
+	if projection.HistoricalDuplicate {
+		if projection.Delta != nil || len(projection.Trades) != 0 || projection.Snapshot == nil || projection.Snapshot.GetSourceMarketId() != marketID {
+			return errors.New("postgres: malformed historical duplicate")
+		}
+		var envelope matching.CommittedMatchingResult
+		if err := proto.Unmarshal(projection.Envelope, &envelope); err != nil {
+			return err
+		}
+		if envelope.GetResult() == nil || envelope.GetResult().GetCommand() == nil || envelope.GetResult().GetCommand().GetMarketId() != marketID || envelope.GetResult().GetMarketSequence() >= projection.Snapshot.GetMarketSequence() {
+			return errors.New("postgres: invalid historical sequence")
+		}
+		canonical, err := (proto.MarshalOptions{Deterministic: true}).Marshal(&envelope)
+		if err != nil {
+			return err
+		}
+		digest := sha256.Sum256(canonical)
+		var known []byte
+		if err = tx.QueryRowContext(ctx, `SELECT payload_sha256 FROM market_data.matching_result_provenance WHERE topic=$1 AND source_market_id=$2 AND market_sequence=$3`, part.Topic, int64(marketID), fmt.Sprint(envelope.GetResult().GetMarketSequence())).Scan(&known); err != nil {
+			return err
+		}
+		if !bytes.Equal(digest[:], known) {
+			return errors.New("postgres: historical duplicate digest conflict")
+		}
+		var oldSHA []byte
+		if err = tx.QueryRowContext(ctx, `SELECT checkpoint_sha256 FROM market_data.book_checkpoints WHERE topic=$1 AND partition_id=$2 AND source_market_id=$3`, part.Topic, part.ID, int64(marketID)).Scan(&oldSHA); err != nil {
+			return err
+		}
+		checkpointSHA := sha256.Sum256(blob)
+		if !bytes.Equal(checkpointSHA[:], oldSHA) {
+			return errors.New("postgres: historical duplicate would modify checkpoint")
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE market_data.partition_cursors SET next_offset=$3, updated_at=now() WHERE topic=$1 AND partition_id=$2`, part.Topic, part.ID, expectedOffset+1); err != nil {
+			return err
+		}
+		return tx.Commit()
 	}
 	sha := sha256.Sum256(blob)
 	if _, err = tx.ExecContext(ctx, `

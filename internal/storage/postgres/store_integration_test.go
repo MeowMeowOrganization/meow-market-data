@@ -76,10 +76,39 @@ func TestPostgresFenceAtomicCheckpointAndCorruption(t *testing.T) {
 	if err := store.Save(ctx, p, b.FenceToken, 1, mk(2, "state-2")); err != nil {
 		t.Fatal(err)
 	}
+	// A historical duplicate at a NEW Kafka offset changes the cursor alone.
+	original := mk(1, "unused")
+	digest, e := store.ProvenanceDigest(ctx, p, 7, 1)
+	if e != nil || len(digest) != 32 {
+		t.Fatalf("missing immutable digest: %v", e)
+	}
+	stateBefore := []byte("state-2")
+	duplicate := recovery.DurableProjection{MarketID: 7, Checkpoint: stateBefore, Envelope: original.Envelope,
+		Snapshot: mk(2, "unused").Snapshot, HistoricalDuplicate: true}
+	if err = store.Save(ctx, p, b.FenceToken, 2, duplicate); err != nil {
+		t.Fatalf("historical duplicate: %v", err)
+	}
+	altered := duplicate
+	var different matching.CommittedMatchingResult
+	if err = proto.Unmarshal(original.Envelope, &different); err != nil {
+		t.Fatal(err)
+	}
+	different.RecordedAt = timestamppb.New(different.GetRecordedAt().AsTime().Add(time.Second))
+	altered.Envelope, err = proto.Marshal(&different)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Save(ctx, p, b.FenceToken, 3, altered); err == nil {
+		t.Fatal("accepted valid conflicting historical payload")
+	}
+	var offsetAfterConflict int64
+	if err = db.QueryRowContext(ctx, `SELECT next_offset FROM market_data.partition_cursors WHERE topic=$1 AND partition_id=$2`, p.Topic, p.ID).Scan(&offsetAfterConflict); err != nil || offsetAfterConflict != 3 {
+		t.Fatalf("conflict moved durable Kafka cursor: offset=%d err=%v", offsetAfterConflict, err)
+	}
 	if err := store.Release(ctx, p, a.FenceToken); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Save(ctx, p, b.FenceToken, 2, mk(3, "state-3")); err != nil {
+	if err := store.Save(ctx, p, b.FenceToken, 3, mk(3, "state-3")); err != nil {
 		t.Fatalf("stale release revoked newer fence: %v", err)
 	}
 	if _, err := db.ExecContext(ctx, `UPDATE market_data.book_checkpoints SET checkpoint=$3 WHERE topic=$1 AND partition_id=$2`, p.Topic, p.ID, []byte("corrupt")); err != nil {

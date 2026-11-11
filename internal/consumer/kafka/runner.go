@@ -14,6 +14,7 @@ import (
 )
 
 type Config struct {
+	Monitor  *SourceMonitor
 	Brokers  []string
 	Topic    string
 	Group    string
@@ -48,6 +49,9 @@ func Run(ctx context.Context, cfg Config, worker *recovery.Worker) error {
 	acquire := func(_ context.Context, _ *kgo.Client, assignments map[string][]int32) {
 		for topic, parts := range assignments {
 			for _, id := range parts {
+				if cfg.Monitor != nil {
+					cfg.Monitor.assigned(id)
+				}
 				if err := worker.Assign(ctx, recovery.Partition{Topic: topic, ID: id}); err != nil {
 					fail(fmt.Errorf("kafka assignment: %w", err))
 					return
@@ -60,6 +64,9 @@ func Run(ctx context.Context, cfg Config, worker *recovery.Worker) error {
 		defer done()
 		for topic, parts := range assignments {
 			for _, id := range parts {
+				if cfg.Monitor != nil {
+					cfg.Monitor.revoked(id)
+				}
 				if err := worker.Revoke(cleanup, recovery.Partition{Topic: topic, ID: id}); err != nil {
 					fail(fmt.Errorf("kafka revocation: %w", err))
 					return
@@ -96,6 +103,14 @@ func Run(ctx context.Context, cfg Config, worker *recovery.Worker) error {
 		// milestone: no long processing can block a group rebalance for a large
 		// batch. Increase only after throughput/rebalance testing.
 		fetches := client.PollRecords(ctx, 1)
+		if cfg.Monitor != nil {
+			observed := time.Now().UTC()
+			fetches.EachPartition(func(part kgo.FetchTopicPartition) {
+				if part.Topic == cfg.Topic && part.Err == nil {
+					cfg.Monitor.sampled(part.Partition, part.LastStableOffset, observed)
+				}
+			})
+		}
 		var processErr error
 		fetches.EachError(func(topic string, partition int32, err error) {
 			if processErr == nil && ctx.Err() == nil {

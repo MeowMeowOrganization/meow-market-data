@@ -147,7 +147,7 @@ func Candle(market string, interval md.CandleInterval, start time.Time, rows []*
 
 // Stats24h always returns valid zero-volume statistics for empty windows.
 // The window is (asOf - 24h, asOf], not the UTC calendar day.
-func Stats24h(market string, asOf time.Time, rows []*md.TradeTick) (*md.Stats24H, error) {
+func Stats24h(market string, asOf time.Time, rows []*md.TradeTick, reference ...uint64) (*md.Stats24H, error) {
 	if market == "" {
 		return nil, ErrInvalid
 	}
@@ -173,9 +173,14 @@ func Stats24h(market string, asOf time.Time, rows []*md.TradeTick) (*md.Stats24H
 	open, high, low, close := a.open, a.high, a.low, a.close
 	out.OpenPriceUnits, out.HighPriceUnits, out.LowPriceUnits, out.ClosePriceUnits = &open, &high, &low, &close
 	out.BaseVolumeAtoms, out.QuoteVolumeAtoms, out.TradeCount = a.base.String(), a.quote.String(), a.count
-	diff := new(big.Int).Sub(new(big.Int).SetUint64(close), new(big.Int).SetUint64(open))
-	diff.Mul(diff, big.NewInt(10000))
-	diff.Quo(diff, new(big.Int).SetUint64(open)) // truncated toward zero
-	out.PriceChangeBps = diff.String()
+	if len(reference) > 0 {
+		if len(reference) != 1 || reference[0] == 0 {
+			return nil, ErrInvalid
+		}
+		diff := new(big.Int).Sub(new(big.Int).SetUint64(close), new(big.Int).SetUint64(reference[0]))
+		diff.Mul(diff, big.NewInt(10000))
+		diff.Quo(diff, new(big.Int).SetUint64(reference[0]))
+		out.PriceChangeBps = diff.String()
+	}
 	return out, nil
 }

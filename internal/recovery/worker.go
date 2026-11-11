@@ -5,6 +5,7 @@ package recovery
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"math"
@@ -61,12 +62,19 @@ type Assignment struct {
 // MUST commit in the same PostgreSQL transaction. Delta == nil only for an
 // exact duplicate of the latest matcher result at a new Kafka offset.
 type DurableProjection struct {
-	MarketID   uint32
-	Checkpoint []byte
-	Envelope   []byte
-	Delta      *marketdatav1.BookDelta
-	Snapshot   *marketdatav1.BookSnapshot
-	Trades     []*marketdatav1.TradeTick
+	MarketID            uint32
+	Checkpoint          []byte
+	Envelope            []byte
+	Delta               *marketdatav1.BookDelta
+	Snapshot            *marketdatav1.BookSnapshot
+	Trades              []*marketdatav1.TradeTick
+	HistoricalDuplicate bool // skip book/projection writes, advance only cursor
+}
+
+// ProvenanceStore verifies previously committed matching results. The index is
+// authoritative; missing records must fail closed, never be treated as new.
+type ProvenanceStore interface {
+	ProvenanceDigest(context.Context, Partition, uint32, uint64) ([]byte, error)
 }
 
 type Store interface {
@@ -200,6 +208,37 @@ func (w *Worker) Process(ctx context.Context, r Record) (*marketdatav1.BookDelta
 		return nil, fmt.Errorf("%w: noncanonical key for market=%d", ErrInvalidRecord, id)
 	}
 	p := s.projectors[id]
+	seq := envelope.GetResult().GetMarketSequence()
+	if seq > 0 && seq < p.Sequence() {
+		provenance, ok := w.store.(ProvenanceStore)
+		if !ok {
+			return nil, errors.New("recovery: historical provenance store unavailable")
+		}
+		known, lookupErr := provenance.ProvenanceDigest(ctx, r.Partition, id, seq)
+		if lookupErr != nil {
+			return nil, fmt.Errorf("recovery: historical provenance lookup: %w", lookupErr)
+		}
+		canonical, marshalErr := (proto.MarshalOptions{Deterministic: true}).Marshal(&envelope)
+		if marshalErr != nil {
+			return nil, marshalErr
+		}
+		digest := sha256.Sum256(canonical)
+		if !bytes.Equal(known, digest[:]) {
+			return nil, fmt.Errorf("%w: historical market=%d sequence=%d", book.ErrConflictingReplay, id, seq)
+		}
+		checkpoint, marshalErr := p.MarshalCheckpoint()
+		if marshalErr != nil {
+			s.poisoned = true
+			return nil, marshalErr
+		}
+		duplicate := DurableProjection{MarketID: id, Checkpoint: checkpoint, Envelope: append([]byte(nil), r.Value...), Snapshot: p.Snapshot(), HistoricalDuplicate: true}
+		if saveErr := w.store.Save(ctx, r.Partition, s.assignment.FenceToken, r.Offset, duplicate); saveErr != nil {
+			s.poisoned = true
+			return nil, fmt.Errorf("%w: historical duplicate cursor: %v", ErrPoisoned, saveErr)
+		}
+		s.assignment.NextOffset = r.Offset + 1
+		return nil, nil
+	}
 	delta, err := p.Apply(&envelope)
 	if err != nil {
 		return nil, fmt.Errorf("project market=%d offset=%d: %w", id, r.Offset, err)

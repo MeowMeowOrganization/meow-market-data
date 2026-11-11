@@ -70,7 +70,7 @@ fi
 "${COMPOSE[@]}" exec -T postgres psql -v ON_ERROR_STOP=1 -U meow -d postgres \
   -c "CREATE DATABASE \"$DB_NAME\";"
 CREATED_DB=1
-for migration in migrations/000001_recovery.sql migrations/000002_public_projections.sql migrations/000003_stream_candles.sql; do
+for migration in migrations/000001_recovery.sql migrations/000002_public_projections.sql migrations/000003_stream_candles.sql migrations/000004_trade_minute_rollups.sql migrations/000005_cex25_finality_provenance.sql; do
   "${COMPOSE[@]}" exec -T postgres psql -v ON_ERROR_STOP=1 -U meow -d "$DB_NAME" < "$migration" >/dev/null
   echo "Applied $migration"
 done
@@ -91,6 +91,8 @@ export MARKET_DATA_KAFKA_CLIENT_ID='meow-md-e2e'
 export MARKET_DATA_MARKETS_FILE="$ROOT/config/markets.example.json"
 export MARKET_DATA_REDIS_URL='redis://127.0.0.1:6382/0'
 export MARKET_DATA_REDIS_REFRESH_INTERVAL='1s'
+export MARKET_DATA_REDIS_BOOK_POLL_INTERVAL='100ms'
+export MARKET_DATA_REDIS_PROJECTION_EPOCH='1'
 export MARKET_DATA_HTTP_ADDR='127.0.0.1:18090'
 export MARKET_DATA_CURSOR_SECRET='cex237-e2e-local-not-a-real-production-secret-12345678'
 export MARKET_DATA_PUBLIC_ALLOWED_ORIGINS='http://localhost:5173'
@@ -117,6 +119,7 @@ start_service() {
 
 common=(--dsn "$MARKET_DATA_DATABASE_URL" --redis "$MARKET_DATA_REDIS_URL" \
   --brokers "$MARKET_DATA_KAFKA_BROKERS" --topic "$TOPIC" \
+  --redis-epoch "$MARKET_DATA_REDIS_PROJECTION_EPOCH" \
   --http 'http://127.0.0.1:18090')
 
 echo '=== Phase 1: Kafka -> PostgreSQL -> Redis -> Connect/WebSocket ==='
@@ -128,4 +131,12 @@ stop_service
 start_service
 "$TMP/e2e-check" --phase recovery "${common[@]}"
 
-echo 'PASS CEX 23.7: full market-data end-to-end verification'
+echo '=== Phase 3: Redis temporarily unavailable -> PostgreSQL API fallback ==='
+"${COMPOSE[@]}" stop redis-e2e >/dev/null
+"$TMP/e2e-check" --phase outage "${common[@]}"
+
+echo '=== Phase 4: Redis restarted -> automatic cache reconstruction ==='
+"${COMPOSE[@]}" up -d --wait redis-e2e
+"$TMP/e2e-check" --phase restored "${common[@]}"
+
+echo 'PASS CEX 24.3: incremental projection, rolling statistics, outage fallback and Redis recovery'

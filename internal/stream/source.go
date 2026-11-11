@@ -8,13 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-	"strings"
 	"time"
 
 	md "github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/marketdata/v1alpha1"
+	"github.com/MeowMeowOrganization/meow-market-data/internal/bookcheck"
 	"github.com/MeowMeowOrganization/meow-market-data/internal/marketregistry"
 	"github.com/MeowMeowOrganization/meow-market-data/internal/readmodel"
-	"github.com/MeowMeowOrganization/meow-market-data/internal/storage/postgres"
+	rediscache "github.com/MeowMeowOrganization/meow-market-data/internal/storage/redis"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -44,9 +44,10 @@ type Source interface {
 }
 
 type PostgresSource struct {
-	DB    *sql.DB
-	Topic string
-	Cache *redis.Client // optional read-only fast path for periodic soft updates
+	DB             *sql.DB
+	Topic          string
+	Cache          *redis.Client // optional read-only fast path for periodic soft updates
+	CacheNamespace rediscache.Namespace
 }
 
 func (s *PostgresSource) check() error {
@@ -258,26 +259,19 @@ func (s *PostgresSource) Current(ctx context.Context, m marketregistry.Market, a
 		return nil, err
 	}
 	if s.Cache != nil {
-		prefix := fmt.Sprintf("md:v1:m:{%d}:", m.SourceID)
 		cacheCtx, stop := context.WithTimeout(ctx, 200*time.Millisecond)
-		freshness, err := s.Cache.HGet(cacheCtx, prefix+"state", "asof_sort").Result()
-		cutoff := at.UTC().Add(-20 * time.Second)
-		from := postgres.NanosDecimal(cutoff)
-		fresh := err == nil && len(freshness) == 30 && len(from) <= 30 && freshness >= strings.Repeat("0", 30-len(from))+from
-		var values []any
-		if fresh {
-			values, err = s.Cache.MGet(cacheCtx, prefix+"ticker", prefix+"stats:24h").Result()
-		}
+		view, err := rediscache.ReadFresh(cacheCtx, s.Cache, s.CacheNamespace, m.SourceID, m.DefinitionVersion, at, "ticker", "stats:24h", "book:top")
 		stop()
-		if fresh && err == nil && len(values) == 2 {
-			ts, ok1 := values[0].(string)
-			st, ok2 := values[1].(string)
-			if ok1 && ok2 {
-				ticker, stats := new(md.Ticker), new(md.Stats24H)
-				if protojson.Unmarshal([]byte(ts), ticker) == nil && protojson.Unmarshal([]byte(st), stats) == nil &&
-					ticker.GetMarketId() == m.Symbol && ticker.GetMarketSequence() > 0 && stats.GetMarketId() == m.Symbol {
-					return &Soft{Ticker: ticker, Stats: stats}, nil
-				}
+		if err == nil {
+			ticker, stats, book := new(md.Ticker), new(md.Stats24H), new(md.BookSnapshot)
+			if protojson.Unmarshal([]byte(view.Values[0]), ticker) == nil && protojson.Unmarshal([]byte(view.Values[1]), stats) == nil &&
+				protojson.Unmarshal([]byte(view.Values[2]), book) == nil &&
+				bookcheck.Validate(book, bookcheck.Expected{SourceMarketID: m.SourceID, MarketID: m.Symbol,
+					DefinitionVersion: m.DefinitionVersion, Depth: m.Depth, PriceTickUnits: m.PriceTickUnits,
+					QuantityStepBaseAtoms: m.QuantityStepAtoms}) == nil &&
+				book.GetMarketSequence() == view.Sequence && bookcheck.ValidateTicker(ticker, book) == nil &&
+				bookcheck.ValidateStats(stats, m.Symbol, at) == nil {
+				return &Soft{Ticker: ticker, Stats: stats}, nil
 			}
 		}
 	}

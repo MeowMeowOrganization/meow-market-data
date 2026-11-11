@@ -1,6 +1,6 @@
-// Package redis maintains disposable market-data read models. The entire
-// bundle is replaced in ONE Lua script and fenced by uint64-safe lexical
-// sequence numbers; no Redis floating-point score is ever used.
+// Package redis maintains disposable market-data read models. Full bundles are
+// published atomically and fenced by exact unsigned decimal sequences; Redis
+// must never participate in durable matching-result acknowledgement.
 package redis
 
 import (
@@ -10,42 +10,61 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	md "github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/marketdata/v1alpha1"
 	"github.com/MeowMeowOrganization/meow-market-data/internal/readmodel"
 	"github.com/MeowMeowOrganization/meow-market-data/internal/storage/postgres"
-	"github.com/redis/go-redis/v9"
+	goredis "github.com/redis/go-redis/v9"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
 
-// Script checks the monotonic pair (market sequence, refresh time) as padded
-// decimal ASCII. Redis Lua tonumber would silently round uint64 > 2^53.
-// All keys share the same Redis Cluster hash tag {marketID}.
+// Script checks (sequence, as-of) as padded decimal ASCII. Lua tonumber loses
+// precision for uint64 above 2^53. KEYS share the market ID hash tag.
+// A stale update is reported to the caller, never silently treated as applied.
 const replaceBundle = `
 local oldseq = redis.call('HGET', KEYS[1], 'sequence_sort')
 local oldasof = redis.call('HGET', KEYS[1], 'asof_sort')
+-- Corrupt or future-dated refresh timestamps must not lock a sequence forever.
+if oldasof and (#oldasof ~= 30 or string.find(oldasof, '[^0-9]') or oldasof > ARGV[3]) then
+  oldasof = nil
+end
 if oldseq and (oldseq > ARGV[1] or (oldseq == ARGV[1] and oldasof and oldasof > ARGV[2])) then
   return 0
 end
 for i=2,#KEYS do
-  redis.call('SET', KEYS[i], ARGV[i+1])
+  redis.call('SET', KEYS[i], ARGV[i+2])
 end
-redis.call('HSET', KEYS[1], 'sequence_sort', ARGV[1], 'asof_sort', ARGV[2], 'sequence', ARGV[#KEYS+2])
+redis.call('HSET', KEYS[1], 'sequence_sort', ARGV[1], 'asof_sort', ARGV[2], 'sequence', ARGV[#KEYS+3])
 return 1
 `
 
-type Cache struct{ Client *redis.Client }
+type PublishResult = readmodel.PublishResult
 
-func New(url string) (*Cache, error) {
+const (
+	PublishApplied = readmodel.PublishApplied
+	PublishStale   = readmodel.PublishStale
+)
+
+type Cache struct {
+	Client    *goredis.Client
+	Namespace Namespace
+}
+
+func New(url, topic, epoch string) (*Cache, error) {
 	if url == "" {
 		return nil, errors.New("redis: URL required")
 	}
-	opts, err := redis.ParseURL(url)
+	namespace, err := NewNamespace(topic, epoch)
 	if err != nil {
 		return nil, err
 	}
-	return &Cache{Client: redis.NewClient(opts)}, nil
+	opts, err := goredis.ParseURL(url)
+	if err != nil {
+		return nil, err
+	}
+	return &Cache{Client: goredis.NewClient(opts), Namespace: namespace}, nil
 }
 func (c *Cache) Close() error { return c.Client.Close() }
 
@@ -77,39 +96,48 @@ func marshaledList[T proto.Message](items []T) (string, error) {
 	return string(b), err
 }
 
-func (c *Cache) Publish(ctx context.Context, b *readmodel.Bundle) error {
-	if c == nil || c.Client == nil || b == nil || b.Snapshot == nil || b.Ticker == nil || b.Stats == nil || b.SourceMarketID != b.Snapshot.GetSourceMarketId() {
-		return errors.New("redis: incomplete read model")
+func (c *Cache) Publish(ctx context.Context, b *readmodel.Bundle) (PublishResult, error) {
+	if c == nil || c.Client == nil || !c.Namespace.Valid() {
+		return 0, errors.New("redis: missing client or source namespace")
+	}
+	if err := ValidateBundle(b); err != nil {
+		return 0, err
+	}
+	if b.AsOf.After(time.Now().UTC().Add(5 * time.Second)) {
+		return 0, fmt.Errorf("%w: future refresh time", ErrInvalidBundle)
 	}
 	seq := strconv.FormatUint(b.Snapshot.GetMarketSequence(), 10)
 	seqSort, err := padDecimal(seq, 20)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	asof := postgres.NanosDecimal(b.AsOf)
-	asofSort, err := padDecimal(asof, 30) // positive Unix time for current operation
+	asofSort, err := padDecimal(asof, 30)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	market := strconv.FormatUint(uint64(b.SourceMarketID), 10)
-	prefix := "md:v1:m:{" + market + "}:"
+	prefix := c.Namespace.MarketPrefix(b.SourceMarketID, b.Snapshot.GetMarketDefinitionVersion())
 	keys := []string{prefix + "state", prefix + "book:top", prefix + "ticker", prefix + "trades:latest", prefix + "stats:24h"}
-	args := []any{seqSort, asofSort}
+	upper, err := padDecimal(postgres.NanosDecimal(time.Now().UTC().Add(5*time.Second)), 30)
+	if err != nil {
+		return 0, err
+	}
+	args := []any{seqSort, asofSort, upper}
 	snapshot, err := marshaledMessage(b.Snapshot)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	ticker, err := marshaledMessage(b.Ticker)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	trades, err := marshaledList(b.LatestTrades)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	stats, err := marshaledMessage(b.Stats)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	args = append(args, snapshot, ticker, trades, stats)
 	for _, interval := range []struct {
@@ -125,18 +153,21 @@ func (c *Cache) Publish(ctx context.Context, b *readmodel.Bundle) error {
 		keys = append(keys, prefix+"candles:"+interval.suffix)
 		value, err := marshaledList(b.Candles[interval.kind])
 		if err != nil {
-			return err
+			return 0, err
 		}
 		args = append(args, value)
 	}
-	// The raw sequence is the last argument. No Lua numeric parsing occurs.
-	args = append(args, seq)
+	args = append(args, seq) // raw sequence; Lua never parses it as a number
 	result, err := c.Client.Eval(ctx, replaceBundle, keys, args...).Result()
 	if err != nil {
-		return fmt.Errorf("redis: atomic view update: %w", err)
+		return 0, fmt.Errorf("redis: atomic view update: %w", err)
 	}
-	if result != int64(0) && result != int64(1) {
-		return fmt.Errorf("redis: unexpected Lua result %v", result)
+	switch result {
+	case int64(0):
+		return PublishStale, nil
+	case int64(1):
+		return PublishApplied, nil
+	default:
+		return 0, fmt.Errorf("redis: unexpected Lua result %v", result)
 	}
-	return nil
 }

@@ -9,13 +9,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	md "github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/marketdata/v1alpha1"
+	"github.com/MeowMeowOrganization/meow-market-data/internal/bookcheck"
 	"github.com/MeowMeowOrganization/meow-market-data/internal/marketregistry"
 	"github.com/MeowMeowOrganization/meow-market-data/internal/readmodel"
 	"github.com/MeowMeowOrganization/meow-market-data/internal/storage/postgres"
+	rediscache "github.com/MeowMeowOrganization/meow-market-data/internal/storage/redis"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -25,9 +26,10 @@ var ErrNotReady = readmodel.ErrNotReady
 var ErrCorrupt = errors.New("publicapi: inconsistent durable projection")
 
 type Repository struct {
-	DB    *sql.DB
-	Topic string
-	Cache *redis.Client // optional: all methods have a durable PG fallback
+	DB             *sql.DB
+	Topic          string
+	Cache          *redis.Client // optional: all methods have a durable PG fallback
+	CacheNamespace rediscache.Namespace
 }
 
 func (r *Repository) check() error {
@@ -36,40 +38,21 @@ func (r *Repository) check() error {
 	}
 	return nil
 }
-func cacheKey(m marketregistry.Market, suffix string) string {
-	return fmt.Sprintf("md:v1:m:{%d}:%s", m.SourceID, suffix)
-}
-func (r *Repository) cacheFresh(ctx context.Context, m marketregistry.Market, now time.Time) bool {
-	if r.Cache == nil {
-		return false
+
+// Cached payload and its sequence are read in one Redis Lua invocation;
+// a concurrent refresh cannot mix metadata with another version's payload.
+func (r *Repository) cacheView(ctx context.Context, m marketregistry.Market, now time.Time, suffixes ...string) (rediscache.View, error) {
+	if r == nil || r.Cache == nil {
+		return rediscache.View{}, rediscache.ErrUnavailableView
 	}
 	cacheCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
 	defer cancel()
-	recorded, err := r.Cache.HGet(cacheCtx, cacheKey(m, "state"), "asof_sort").Result()
-	if err != nil || len(recorded) != 30 {
-		return false
-	}
-	cutoff := postgres.NanosDecimal(now.Add(-20 * time.Second))
-	if len(cutoff) > 30 {
-		return false
-	}
-	return recorded >= strings.Repeat("0", 30-len(cutoff))+cutoff
-}
-func (r *Repository) cached(ctx context.Context, m marketregistry.Market, suffix string, msg proto.Message) bool {
-	if !r.cacheFresh(ctx, m, time.Now().UTC()) {
-		return false
-	}
-	cacheCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
-	defer cancel()
-	s, err := r.Cache.Get(cacheCtx, cacheKey(m, suffix)).Result()
-	if err != nil {
-		return false
-	}
-	return protojson.Unmarshal([]byte(s), msg) == nil
+	return rediscache.ReadFresh(cacheCtx, r.Cache, r.CacheNamespace, m.SourceID, m.DefinitionVersion, now, suffixes...)
 }
 func validateBook(s *md.BookSnapshot, m marketregistry.Market) error {
-	if s == nil || s.GetSourceMarketId() != m.SourceID || s.GetMarketId() != m.Symbol ||
-		s.GetDepth() != m.Depth || s.GetMarketDefinitionVersion() != m.DefinitionVersion || s.GetMarketSequence() == 0 {
+	if err := bookcheck.Validate(s, bookcheck.Expected{SourceMarketID: m.SourceID, MarketID: m.Symbol,
+		DefinitionVersion: m.DefinitionVersion, Depth: m.Depth, PriceTickUnits: m.PriceTickUnits,
+		QuantityStepBaseAtoms: m.QuantityStepAtoms}); err != nil {
 		return ErrCorrupt
 	}
 	return nil
@@ -92,13 +75,24 @@ func (r *Repository) Snapshot(ctx context.Context, m marketregistry.Market) (*md
 	}
 	return snap, validateBook(snap, m)
 }
+
+// Book prefers the independently sequence-fenced live L2 projection. The
+// periodic full bundle may trail this book and must never mask live failures.
+// If Redis is missing, corrupt or behind its health check, use durable PG.
 func (r *Repository) Book(ctx context.Context, m marketregistry.Market, depth uint32) (*md.BookSnapshot, error) {
+	if err := r.check(); err != nil {
+		return nil, err
+	}
 	if depth == 0 || depth > m.Depth {
 		return nil, errors.New("publicapi: invalid book depth")
 	}
-	cached := new(md.BookSnapshot)
-	if r.cached(ctx, m, "book:top", cached) && validateBook(cached, m) == nil {
-		return clipDepth(cached, depth), nil
+	if r.Cache != nil {
+		cacheCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+		live, err := rediscache.LoadLiveBook(cacheCtx, r.Cache, r.CacheNamespace, m, time.Now().UTC(), true)
+		cancel()
+		if err == nil {
+			return clipDepth(live.Snapshot, depth), nil
+		}
 	}
 	durable, err := r.Snapshot(ctx, m)
 	if err != nil {
@@ -124,21 +118,26 @@ func (r *Repository) Trades(ctx context.Context, m marketregistry.Market, limit 
 	if limit == 0 || limit > 1000 {
 		return nil, errors.New("publicapi: invalid trade limit")
 	}
-	if limit <= readmodel.RecentTradesLimit && r.cacheFresh(ctx, m, time.Now().UTC()) {
-		cacheCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
-		s, err := r.Cache.Get(cacheCtx, cacheKey(m, "trades:latest")).Result()
-		cancel()
+	if limit <= readmodel.RecentTradesLimit {
+		view, err := r.cacheView(ctx, m, time.Now().UTC(), "trades:latest")
 		if err == nil {
 			var raw []json.RawMessage
-			if json.Unmarshal([]byte(s), &raw) == nil && len(raw) > 0 {
+			if json.Unmarshal([]byte(view.Values[0]), &raw) == nil && len(raw) > 0 && len(raw) <= readmodel.RecentTradesLimit {
 				ticks := make([]*md.TradeTick, 0, len(raw))
 				valid := true
-				for _, v := range raw {
+				var previousSequence, previousOrdinal uint64
+				for i, v := range raw {
 					t := new(md.TradeTick)
-					if protojson.Unmarshal(v, t) != nil || t.GetSourceMarketId() != m.SourceID || t.GetMarketId() != m.Symbol {
+					if protojson.Unmarshal(v, t) != nil || t.GetSourceMarketId() != m.SourceID || t.GetMarketId() != m.Symbol ||
+						t.GetTradeId() == "" || t.GetMatchSequence() == 0 || t.GetMatchSequence() > view.Sequence ||
+						t.GetPriceUnits() == 0 || t.GetBaseQuantityAtoms() == 0 || t.GetQuoteQuantityAtoms() == 0 ||
+						t.GetRecordedAt() == nil || t.GetRecordedAt().CheckValid() != nil ||
+						(i > 0 && (t.GetMatchSequence() > previousSequence ||
+							(t.GetMatchSequence() == previousSequence && t.GetEventOrdinal() >= previousOrdinal))) {
 						valid = false
 						break
 					}
+					previousSequence, previousOrdinal = t.GetMatchSequence(), t.GetEventOrdinal()
 					ticks = append(ticks, t)
 				}
 				if valid {
@@ -174,9 +173,15 @@ func (r *Repository) Trades(ctx context.Context, m marketregistry.Market, limit 
 	return out, rows.Err()
 }
 func (r *Repository) Ticker(ctx context.Context, m marketregistry.Market, now time.Time) (*md.Ticker, error) {
-	cached := new(md.Ticker)
-	if r.cached(ctx, m, "ticker", cached) && cached.GetMarketId() == m.Symbol && cached.GetMarketSequence() > 0 {
-		return cached, nil
+	view, err := r.cacheView(ctx, m, now, "ticker", "book:top")
+	if err == nil {
+		ticker, snapshot := new(md.Ticker), new(md.BookSnapshot)
+		if protojson.Unmarshal([]byte(view.Values[0]), ticker) == nil &&
+			protojson.Unmarshal([]byte(view.Values[1]), snapshot) == nil &&
+			validateBook(snapshot, m) == nil && snapshot.GetMarketSequence() == view.Sequence &&
+			bookcheck.ValidateTicker(ticker, snapshot) == nil {
+			return ticker, nil
+		}
 	}
 	b, err := (&readmodel.Reader{DB: r.DB, Topic: r.Topic}).Load(ctx, m.SourceID, now)
 	if err != nil {
@@ -185,15 +190,14 @@ func (r *Repository) Ticker(ctx context.Context, m marketregistry.Market, now ti
 	return b.Ticker, nil
 }
 func (r *Repository) Stats(ctx context.Context, m marketregistry.Market, now time.Time) (*md.Stats24H, error) {
-	cached := new(md.Stats24H)
-	if r.cached(ctx, m, "stats:24h", cached) && cached.GetMarketId() == m.Symbol && cached.GetAsOfInclusive() != nil {
-		return cached, nil
+	view, err := r.cacheView(ctx, m, now, "stats:24h")
+	if err == nil {
+		stats := new(md.Stats24H)
+		if protojson.Unmarshal([]byte(view.Values[0]), stats) == nil && bookcheck.ValidateStats(stats, m.Symbol, now) == nil {
+			return stats, nil
+		}
 	}
-	b, err := (&readmodel.Reader{DB: r.DB, Topic: r.Topic}).Load(ctx, m.SourceID, now)
-	if err != nil {
-		return nil, err
-	}
-	return b.Stats, nil
+	return (&readmodel.Reader{DB: r.DB, Topic: r.Topic}).LoadStats(ctx, m.SourceID, now)
 }
 
 // Candles returns bounded keyset pages ordered oldest-first. A candle's key is

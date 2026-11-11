@@ -15,20 +15,22 @@ import (
 )
 
 type Config struct {
-	DatabaseURL          string
-	Brokers              []string
-	Topic                string
-	Group                string
-	ClientID             string
-	RedisURL             string
-	RedisRefreshInterval time.Duration
-	HTTPAddr             string
-	CursorSecret         string
-	AllowedOrigins       []string
-	MaxWSConnections     int
-	StreamPollInterval   time.Duration
-	StreamSoftInterval   time.Duration
-	Markets              []recovery.MarketConfig
+	DatabaseURL           string
+	Brokers               []string
+	Topic                 string
+	Group                 string
+	ClientID              string
+	RedisURL              string
+	RedisProjectionEpoch  string
+	RedisRefreshInterval  time.Duration
+	RedisBookPollInterval time.Duration
+	HTTPAddr              string
+	CursorSecret          string
+	AllowedOrigins        []string
+	MaxWSConnections      int
+	StreamPollInterval    time.Duration
+	StreamSoftInterval    time.Duration
+	Markets               []recovery.MarketConfig
 }
 
 func LoadFromEnvironment() (Config, error) {
@@ -44,7 +46,12 @@ func LoadFromEnvironment() (Config, error) {
 	cfg.Group = os.Getenv("MARKET_DATA_KAFKA_GROUP")
 	cfg.ClientID = os.Getenv("MARKET_DATA_KAFKA_CLIENT_ID")
 	cfg.RedisURL = os.Getenv("MARKET_DATA_REDIS_URL")
+	cfg.RedisProjectionEpoch = "1"
+	if v := os.Getenv("MARKET_DATA_REDIS_PROJECTION_EPOCH"); v != "" {
+		cfg.RedisProjectionEpoch = v
+	}
 	cfg.RedisRefreshInterval = 5 * time.Second
+	cfg.RedisBookPollInterval = 100 * time.Millisecond
 	cfg.HTTPAddr = "127.0.0.1:8090"
 	if v := os.Getenv("MARKET_DATA_HTTP_ADDR"); v != "" {
 		cfg.HTTPAddr = v
@@ -80,6 +87,9 @@ func LoadFromEnvironment() (Config, error) {
 		}
 		cfg.StreamSoftInterval = d
 	}
+	if len(cfg.RedisProjectionEpoch) > 128 {
+		return cfg, errors.New("bootstrap: Redis projection epoch exceeds 128 bytes")
+	}
 	if len(cfg.CursorSecret) < 32 {
 		return cfg, errors.New("bootstrap: MARKET_DATA_CURSOR_SECRET must contain at least 32 bytes")
 	}
@@ -90,6 +100,13 @@ func LoadFromEnvironment() (Config, error) {
 			return cfg, errors.New("bootstrap: Redis refresh interval must be >= 1s")
 		}
 		cfg.RedisRefreshInterval = d
+	}
+	if v := os.Getenv("MARKET_DATA_REDIS_BOOK_POLL_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 50*time.Millisecond {
+			return cfg, errors.New("bootstrap: Redis book poll interval must be >=50ms")
+		}
+		cfg.RedisBookPollInterval = d
 	}
 	path := os.Getenv("MARKET_DATA_MARKETS_FILE")
 	if cfg.DatabaseURL == "" || len(cfg.Brokers) == 0 || cfg.Topic == "" || cfg.Group == "" || path == "" || cfg.RedisURL == "" {

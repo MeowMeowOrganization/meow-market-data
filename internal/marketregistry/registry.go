@@ -14,6 +14,8 @@ type Market struct {
 	SourceID          uint32
 	DefinitionVersion uint64
 	Depth             uint32
+	PriceTickUnits    uint64
+	QuantityStepAtoms uint64
 }
 
 type Registry struct {
@@ -30,7 +32,7 @@ func New(configs []recovery.MarketConfig) (*Registry, error) {
 		if cfg.Definition == nil || cfg.Definition.GetMarket() == nil {
 			return nil, errors.New("market registry: nil definition")
 		}
-		m := Market{Symbol: cfg.Definition.GetMarket().GetMarketId(), SourceID: cfg.Definition.GetSourceMarketId(), DefinitionVersion: cfg.Definition.GetDefinitionVersion(), Depth: cfg.Depth}
+		m := Market{Symbol: cfg.Definition.GetMarket().GetMarketId(), SourceID: cfg.Definition.GetSourceMarketId(), DefinitionVersion: cfg.Definition.GetDefinitionVersion(), Depth: cfg.Depth, PriceTickUnits: cfg.Definition.GetMarket().GetPriceTickUnits(), QuantityStepAtoms: cfg.Definition.GetMarket().GetQuantityStepBaseAtoms()}
 		if m.Symbol == "" || m.DefinitionVersion == 0 || m.Depth == 0 {
 			return nil, fmt.Errorf("market registry: invalid market: %+v", m)
 		}

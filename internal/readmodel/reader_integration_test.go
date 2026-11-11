@@ -14,6 +14,7 @@ import (
 	md "github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/marketdata/v1alpha1"
 	matching "github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/matching/v1alpha1"
 	orderv1 "github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/order/v1alpha1"
+	"github.com/MeowMeowOrganization/meow-market-data/internal/projection/statistics"
 	"github.com/MeowMeowOrganization/meow-market-data/internal/readmodel"
 	"github.com/MeowMeowOrganization/meow-market-data/internal/recovery"
 	"github.com/MeowMeowOrganization/meow-market-data/internal/storage/postgres"
@@ -25,7 +26,7 @@ import (
 func TestPublicHistoryAtomicCrashReplayAndLateCandleRevision(t *testing.T) {
 	dsn := os.Getenv("MARKET_DATA_TEST_DATABASE_URL")
 	if dsn == "" {
-		t.Skip("requires MARKET_DATA_TEST_DATABASE_URL and applied migration 000002")
+		t.Skip("requires MARKET_DATA_TEST_DATABASE_URL with migrations through 000004")
 	}
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
@@ -132,6 +133,40 @@ func TestPublicHistoryAtomicCrashReplayAndLateCandleRevision(t *testing.T) {
 	if updated.Stats.GetBaseVolumeAtoms() != "2000" || updated.Stats.GetQuoteVolumeAtoms() != "500" {
 		t.Fatal("rolling totals inaccurate")
 	}
+	// CEX25.1: full-trade oracle parity for all materialized intervals.
+	// A result inserted at a later Kafka offset has an earlier recorded time,
+	// but the candle open/close must remain ordered by matching sequence.
+	for _, interval := range statistics.SupportedIntervals() {
+		begin, _, err := statistics.Window(recorded, interval)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var encoded []byte
+		err = db.QueryRowContext(ctx, `SELECT payload FROM market_data.candles
+		    WHERE topic=$1 AND source_market_id=7 AND interval_id=$2 AND start_ns=$3`,
+			topic, int32(interval), postgres.NanosDecimal(begin)).Scan(&encoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		persisted := new(md.Candle)
+		if err := proto.Unmarshal(encoded, persisted); err != nil {
+			t.Fatal(err)
+		}
+		expected, err := statistics.Candle("BTC-USDT", interval, begin, updated.LatestTrades, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !proto.Equal(persisted, expected) {
+			t.Fatalf("%s rollup materialization mismatch: got %v want %v", interval, persisted, expected)
+		}
+	}
+	var rollupCount, rollupBase, rollupQuote string
+	if err := db.QueryRowContext(ctx, `SELECT coalesce(sum(trade_count),0)::text,coalesce(sum(base_volume_atoms),0)::text,
+	     coalesce(sum(quote_volume_atoms),0)::text FROM market_data.trade_minute_rollups
+	     WHERE topic=$1 AND source_market_id=7`, topic).Scan(&rollupCount, &rollupBase, &rollupQuote); err != nil ||
+		rollupCount != "2" || rollupBase != "2000" || rollupQuote != "500" {
+		t.Fatalf("atomic minute rollup not replay-safe: count=%s base=%s quote=%s err=%v", rollupCount, rollupBase, rollupQuote, err)
+	}
 	var durable int
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM market_data.public_trades WHERE topic=$1 AND source_market_id=7`, topic).Scan(&durable); err != nil || durable != 2 {
 		t.Fatalf("dedupe failed count=%d err=%v", durable, err)
@@ -148,5 +183,17 @@ func TestPublicHistoryAtomicCrashReplayAndLateCandleRevision(t *testing.T) {
 	}
 	if d, err := w2.Process(ctx, retry); err != nil || d != nil {
 		t.Fatalf("replay advanced after restart: %v %v", d, err)
+	}
+	// Replaying an already committed Kafka offset must not revise candles or
+	// duplicate the append-only candle update journal.
+	var updates, candles int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM market_data.candle_updates WHERE topic=$1 AND source_market_id=7`, topic).Scan(&updates); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM market_data.candles WHERE topic=$1 AND source_market_id=7 AND revision=1`, topic).Scan(&candles); err != nil {
+		t.Fatal(err)
+	}
+	if updates != 10 || candles != 5 {
+		t.Fatalf("replayed duplicate mutated history: updates=%d revised_candles=%d", updates, candles)
 	}
 }

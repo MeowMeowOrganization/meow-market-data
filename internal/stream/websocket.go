@@ -164,10 +164,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			_, _, e := ws.ReadMessage()
 			if e != nil {
 				readErrors <- e
+				return
 			} else {
 				readErrors <- errors.New("client application frames not supported")
+				return
 			}
-			return
 		}
 	}()
 

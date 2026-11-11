@@ -2,6 +2,7 @@ package recovery
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	marketdatav1 "github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/marketdata/v1alpha1"
 	matchingv1 "github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/matching/v1alpha1"
 	orderv1 "github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/order/v1alpha1"
+	"github.com/MeowMeowOrganization/meow-market-data/internal/projection/book"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -19,9 +21,10 @@ import (
 var part = Partition{Topic: "matching.results.committed.v1", ID: 0}
 
 type state struct {
-	next      int64
-	token     string
-	snapshots map[uint32][]byte
+	next       int64
+	token      string
+	snapshots  map[uint32][]byte
+	provenance map[uint32]map[uint64][32]byte
 }
 type memoryStore struct {
 	mu         sync.Mutex
@@ -37,7 +40,7 @@ func (m *memoryStore) Acquire(_ context.Context, p Partition) (Assignment, error
 	defer m.mu.Unlock()
 	s := m.states[p]
 	if s == nil {
-		s = &state{snapshots: make(map[uint32][]byte)}
+		s = &state{snapshots: make(map[uint32][]byte), provenance: make(map[uint32]map[uint64][32]byte)}
 		m.states[p] = s
 	}
 	m.generation++
@@ -61,10 +64,55 @@ func (m *memoryStore) Save(_ context.Context, p Partition, tok string, offset in
 	if s.next != offset {
 		return errors.New("cursor conflict")
 	}
-	s.snapshots[projection.MarketID] = append([]byte(nil), projection.Checkpoint...)
+	if projection.HistoricalDuplicate {
+		if projection.Delta != nil || len(projection.Trades) != 0 {
+			return errors.New("duplicate mutated data")
+		}
+		var env matchingv1.CommittedMatchingResult
+		if e := proto.Unmarshal(projection.Envelope, &env); e != nil {
+			return e
+		}
+		canonical, e := (proto.MarshalOptions{Deterministic: true}).Marshal(&env)
+		if e != nil {
+			return e
+		}
+		digest := sha256.Sum256(canonical)
+		if digest != s.provenance[projection.MarketID][env.GetResult().GetMarketSequence()] {
+			return errors.New("duplicate digest mismatch")
+		}
+		if string(projection.Checkpoint) != string(s.snapshots[projection.MarketID]) {
+			return errors.New("duplicate modified checkpoint")
+		}
+	} else {
+		s.snapshots[projection.MarketID] = append([]byte(nil), projection.Checkpoint...)
+		if projection.Delta != nil {
+			var env matchingv1.CommittedMatchingResult
+			if e := proto.Unmarshal(projection.Envelope, &env); e != nil {
+				return e
+			}
+			canonical, e := (proto.MarshalOptions{Deterministic: true}).Marshal(&env)
+			if e != nil {
+				return e
+			}
+			if s.provenance[projection.MarketID] == nil {
+				s.provenance[projection.MarketID] = map[uint64][32]byte{}
+			}
+			s.provenance[projection.MarketID][env.GetResult().GetMarketSequence()] = sha256.Sum256(canonical)
+		}
+	}
 	s.next++
 	m.writes++
 	return nil
+}
+func (m *memoryStore) ProvenanceDigest(_ context.Context, p Partition, id uint32, seq uint64) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if s := m.states[p]; s != nil {
+		if digest, ok := s.provenance[id][seq]; ok {
+			return append([]byte(nil), digest[:]...), nil
+		}
+	}
+	return nil, errors.New("missing immutable provenance")
 }
 func (m *memoryStore) Release(_ context.Context, p Partition, tok string) error {
 	m.mu.Lock()
@@ -109,7 +157,7 @@ func record(offset int64, market uint32, seq uint64, id uint64) *Record {
 	if err != nil {
 		panic(err)
 	}
-	return &Record{Partition: part, Offset: offset, Key: []byte(fmt.Sprint(market)), Value: data}
+	return &Record{Partition: part, Offset: offset, Key: fmt.Append(nil, market), Value: data}
 }
 func process(t *testing.T, w *Worker, r *Record) {
 	t.Helper()
@@ -235,5 +283,50 @@ func TestDuplicateMatchingResultAtNewKafkaOffset(t *testing.T) {
 	process(t, w, record(2, 7, 2, 11))
 	if store.writes != 3 {
 		t.Fatal("duplicate source offset was not checkpointed")
+	}
+}
+
+func TestHistoricalDuplicatePreservesStateAndAdvancesCursor(t *testing.T) {
+	store := newStore()
+	w := makeWorker(t, store)
+	assign(t, w)
+	first := record(0, 7, 1, 10)
+	process(t, w, first)
+	process(t, w, record(1, 7, 2, 11))
+	process(t, w, record(2, 7, 3, 12))
+	before := append([]byte(nil), store.states[part].snapshots[7]...)
+	older := *first
+	older.Offset = 3
+	delta, err := w.Process(context.Background(), older)
+	if err != nil || delta != nil || store.states[part].next != 4 || string(before) != string(store.states[part].snapshots[7]) {
+		t.Fatalf("historical replay delta=%v err=%v", delta, err)
+	}
+	// A different payload at the same source identity must stop processing.
+	bad := record(4, 7, 1, 99)
+	_, err = w.Process(context.Background(), *bad)
+	if !errors.Is(err, book.ErrConflictingReplay) || store.states[part].next != 4 {
+		t.Fatalf("accepted conflicting historical replay: %v", err)
+	}
+	// Restored workers retain history from the durable provenance table.
+	if err = w.Revoke(context.Background(), part); err != nil {
+		t.Fatal(err)
+	}
+	w2 := makeWorker(t, store)
+	assign(t, w2)
+	older.Offset = 4
+	if d, e := w2.Process(context.Background(), older); e != nil || d != nil {
+		t.Fatalf("replay after restore delta=%v err=%v", d, e)
+	}
+}
+func TestMissingHistoricalProvenanceFailsClosed(t *testing.T) {
+	store := newStore()
+	w := makeWorker(t, store)
+	assign(t, w)
+	process(t, w, record(0, 7, 1, 10))
+	process(t, w, record(1, 7, 2, 11))
+	delete(store.states[part].provenance[7], 1)
+	r := record(2, 7, 1, 10)
+	if _, e := w.Process(context.Background(), *r); e == nil || store.states[part].next != 2 {
+		t.Fatalf("missing provenance accepted: %v", e)
 	}
 }
