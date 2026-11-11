@@ -28,6 +28,7 @@ type Config struct {
 	CursorSecret          string
 	AllowedOrigins        []string
 	MaxWSConnections      int
+	MaxBookRPCStreams     int
 	StreamPollInterval    time.Duration
 	StreamSoftInterval    time.Duration
 	Markets               []recovery.MarketConfig
@@ -70,6 +71,14 @@ func LoadFromEnvironment() (Config, error) {
 			return cfg, errors.New("bootstrap: invalid maximum WS connections")
 		}
 		cfg.MaxWSConnections = n
+	}
+	cfg.MaxBookRPCStreams = 256
+	if v := os.Getenv("MARKET_DATA_HTTP_MAX_BOOK_RPC_STREAMS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 10000 {
+			return cfg, errors.New("bootstrap: invalid maximum Connect book streams")
+		}
+		cfg.MaxBookRPCStreams = n
 	}
 	cfg.StreamPollInterval = 250 * time.Millisecond
 	cfg.StreamSoftInterval = 5 * time.Second

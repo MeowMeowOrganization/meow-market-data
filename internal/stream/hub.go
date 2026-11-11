@@ -17,8 +17,9 @@ type Feed struct {
 	Soft   *Soft
 }
 type subscriber struct {
-	ch   chan Feed
-	errs chan error
+	ch       chan Feed
+	errs     chan error
+	bookOnly bool
 }
 
 type Subscription struct {
@@ -58,9 +59,20 @@ func NewHub(parent context.Context, src Source, pollEvery, softEvery time.Durati
 }
 
 // Subscribe registers BEFORE the WebSocket takes its PostgreSQL snapshot.
-// Thus any event committed after that snapshot is either buffered here or
-// remains queryable from the append-only PG journal (no subscribe/snapshot gap).
+// Any later committed event is buffered or is still in the durable journal.
 func (h *Hub) Subscribe(ctx context.Context, m marketregistry.Market) (*Subscription, error) {
+	return h.subscribe(ctx, m, false)
+}
+
+// SubscribeBook shares the market worker but queues ONLY book deltas, not
+// trades/candles or periodic soft updates. This avoids charging an L2 client
+// for unrelated feeds, and prevents large trade batches being kept alive by
+// each book-only subscriber queue.
+func (h *Hub) SubscribeBook(ctx context.Context, m marketregistry.Market) (*Subscription, error) {
+	return h.subscribe(ctx, m, true)
+}
+
+func (h *Hub) subscribe(ctx context.Context, m marketregistry.Market, bookOnly bool) (*Subscription, error) {
 	h.mu.Lock()
 	state := h.markets[m.SourceID]
 	h.mu.Unlock()
@@ -79,12 +91,12 @@ func (h *Hub) Subscribe(ctx context.Context, m marketregistry.Market) (*Subscrip
 		}
 		h.mu.Unlock()
 	}
-	sub := &subscriber{ch: make(chan Feed, h.queue), errs: make(chan error, 1)}
+	sub := &subscriber{ch: make(chan Feed, h.queue), errs: make(chan error, 1), bookOnly: bookOnly}
 	h.mu.Lock()
 	// A prior state could have been stopped between snapshot and registration.
 	if h.markets[m.SourceID] != state {
 		h.mu.Unlock()
-		return h.Subscribe(ctx, m)
+		return h.subscribe(ctx, m, bookOnly)
 	}
 	state.subs[sub] = struct{}{}
 	h.mu.Unlock()
@@ -105,8 +117,23 @@ func (h *Hub) broadcast(state *marketHub, feed Feed) {
 		return
 	}
 	for s := range state.subs {
+		outgoing := feed
+		if s.bookOnly {
+			if feed.Result == nil { // no ticker/stats polling noise
+				continue
+			}
+			if feed.Result.Delta == nil {
+				select {
+				case s.errs <- ErrSequenceGap:
+				default:
+				}
+				delete(state.subs, s)
+				continue
+			}
+			outgoing = Feed{Result: &Result{Delta: feed.Result.Delta}}
+		}
 		select {
-		case s.ch <- feed:
+		case s.ch <- outgoing:
 		default:
 			select {
 			case s.errs <- ErrSlowConsumer:

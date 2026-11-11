@@ -12,6 +12,7 @@ import (
 	md "github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/marketdata/v1alpha1"
 	"github.com/MeowMeowOrganization/meow-market-data/internal/marketregistry"
 	"github.com/MeowMeowOrganization/meow-market-data/internal/storage/postgres"
+	"github.com/MeowMeowOrganization/meow-market-data/internal/stream"
 )
 
 type Queries interface {
@@ -26,6 +27,7 @@ type Service struct {
 	apiv1alpha1connect.UnimplementedMarketDataServiceHandler
 	Registry     *marketregistry.Registry
 	Queries      Queries
+	BookStream   *stream.BookRPC
 	CursorSecret []byte
 	Clock        func() time.Time
 }

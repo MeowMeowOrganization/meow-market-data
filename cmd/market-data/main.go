@@ -107,10 +107,17 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	bookRPC, err := stream.NewBookRPC(registry, source, hub, cfg.MaxBookRPCStreams)
+	if err != nil {
+		return err
+	}
+	rpc.BookStream = bookRPC
 	monitor := kafka.NewSourceMonitor(db, cfg.Topic)
 	mux := http.NewServeMux()
 	prefix, connectHandler := apiv1alpha1connect.NewMarketDataServiceHandler(rpc, connect.WithReadMaxBytes(64<<10), connect.WithSendMaxBytes(4<<20))
-	mux.Handle(prefix, connectHandler)
+	// The response controller must refer to the ORIGINAL HTTP ResponseWriter;
+	// attach it before Connect's internal handler wrappers run.
+	mux.Handle(prefix, stream.WithBookWriteDeadlines(connectHandler))
 	mux.Handle("/v1/market-data/stream", wsHandler)
 	mux.HandleFunc("/source-healthz", monitor.Handler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
