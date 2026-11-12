@@ -1,4 +1,4 @@
-// Command e2e-check verifies CEX 23.7 through the real running service.
+// Command e2e-check verifies the durable market-data and CEX 26 streaming paths through the real running service.
 // It intentionally never imports internal projector/recovery packages: the
 // only write input is Kafka, and all observations are external interfaces.
 package main
@@ -41,6 +41,8 @@ const (
 	price        = uint64(10000) // 400 ticks * 25 price units
 	tradeID2     = "7:2:0"
 	tradeID3     = "7:3:0"
+	tradeID5a    = "7:5:0"
+	tradeID5b    = "7:5:1"
 )
 
 type checker struct {
@@ -53,10 +55,13 @@ type checker struct {
 	redisPrefix    string
 	redisNamespace rediscache.Namespace
 	rpc            apiv1alpha1connect.MarketDataServiceClient
+	streamRPC      apiv1alpha1connect.MarketDataServiceClient
 }
 
 func main() {
-	phase := flag.String("phase", "live", "live, recovery, outage, or restored")
+	phase := flag.String("phase", "live", "live, recovery, outage, restored, streams, disconnect, or reconnected")
+	readyFile := flag.String("ready-file", "", "path to atomically signal that three streams are open (disconnect phase only)")
+	stopFile := flag.String("stop-file", "", "path to a script shutdown signal (disconnect phase only)")
 	dsn := flag.String("dsn", "", "isolated PostgreSQL database URL")
 	redisURL := flag.String("redis", "", "isolated Redis URL")
 	brokers := flag.String("brokers", "127.0.0.1:9094", "Kafka bootstrap brokers")
@@ -64,8 +69,11 @@ func main() {
 	epoch := flag.String("redis-epoch", "1", "Redis cache projection generation; matches service configuration")
 	httpURL := flag.String("http", "http://127.0.0.1:18090", "running market-data listener")
 	flag.Parse()
-	if *dsn == "" || *redisURL == "" || *topic == "" || (*phase != "live" && *phase != "recovery" && *phase != "outage" && *phase != "restored") {
-		log.Fatal("--phase live|recovery|outage|restored, --dsn, --redis, and --topic are required")
+	if *dsn == "" || *redisURL == "" || *topic == "" || (*phase != "live" && *phase != "recovery" && *phase != "outage" && *phase != "restored" && *phase != "streams" && *phase != "disconnect" && *phase != "reconnected") {
+		log.Fatal("--phase live|recovery|outage|restored|streams|disconnect|reconnected, --dsn, --redis, and --topic are required")
+	}
+	if *phase == "disconnect" && (*readyFile == "" || *stopFile == "") {
+		log.Fatal("--ready-file and --stop-file are required for disconnect phase")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -90,7 +98,10 @@ func main() {
 		httpURL:        strings.TrimRight(*httpURL, "/"),
 		redisPrefix:    namespace.MarketPrefix(sourceID, definition),
 		redisNamespace: namespace,
-		rpc:            apiv1alpha1connect.NewMarketDataServiceClient(&http.Client{Timeout: 8 * time.Second}, strings.TrimRight(*httpURL, "/"))}
+		rpc:            apiv1alpha1connect.NewMarketDataServiceClient(&http.Client{Timeout: 8 * time.Second}, strings.TrimRight(*httpURL, "/")),
+		// A finite http.Client.Timeout would terminate even healthy long-lived streams.
+		// Each E2E streaming phase instead has an explicit context deadline.
+		streamRPC: apiv1alpha1connect.NewMarketDataServiceClient(&http.Client{}, strings.TrimRight(*httpURL, "/"))}
 	switch *phase {
 	case "live":
 		must(c.live())
@@ -103,6 +114,12 @@ func main() {
 		must(c.wait("Redis periodic cache restored after outage", func() error { return c.redisState(3) }))
 		must(c.wait("Redis live L2 restored after outage", func() error { return c.liveRedisState(3) }))
 		must(c.rpcState(3))
+	case "streams":
+		must(c.verifyConnectStreams())
+	case "disconnect":
+		must(c.verifyStreamDisconnect(*readyFile, *stopFile))
+	case "reconnected":
+		must(c.verifyStreamReconnect())
 	}
 	fmt.Println("PASS: phase", *phase)
 }
@@ -155,6 +172,30 @@ func envelope(seq uint64, recordedAt time.Time) *matching.CommittedMatchingResul
 				PriceTicks: 400, QuantityLots: lots,
 			}},
 		}}
+	case 4:
+		// A second resting maker at a worse ask, behind order 1001.
+		cmd.Command = &matching.MatchingCommand_PlaceLimitOrder{PlaceLimitOrder: &matching.PlaceLimitOrder{
+			OrderId: 1004, Side: order.OrderSide_ORDER_SIDE_SELL, PriceTicks: 401, QuantityLots: 2,
+		}}
+	case 5:
+		// A single taker crosses TWO distinct resting maker orders. This is a
+		// genuine price-time ordered multi-execution matching result, allowing
+		// lossless mid-sequence trade resume (7:5:0 -> 7:5:1).
+		cmd.Command = &matching.MatchingCommand_PlaceLimitOrder{PlaceLimitOrder: &matching.PlaceLimitOrder{
+			OrderId: 1005, Side: order.OrderSide_ORDER_SIDE_BUY, PriceTicks: 401, QuantityLots: 4,
+		}}
+		events = []*matching.SequencedMatchingEvent{
+			{EventId: &matching.MatchingEventId{MarketId: sourceID, MarketSequence: seq, EventOrdinal: 0},
+				Event: &matching.SequencedMatchingEvent_Exectuion{Exectuion: &matching.Execution{
+					MakerOrderId: 1001, TakerOrderId: 1005, TakerSide: order.OrderSide_ORDER_SIDE_BUY,
+					PriceTicks: 400, QuantityLots: 2,
+				}}},
+			{EventId: &matching.MatchingEventId{MarketId: sourceID, MarketSequence: seq, EventOrdinal: 1},
+				Event: &matching.SequencedMatchingEvent_Exectuion{Exectuion: &matching.Execution{
+					MakerOrderId: 1004, TakerOrderId: 1005, TakerSide: order.OrderSide_ORDER_SIDE_BUY,
+					PriceTicks: 401, QuantityLots: 2,
+				}}},
+		}
 	default:
 		panic("unsupported e2e matching sequence")
 	}

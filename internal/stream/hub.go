@@ -25,6 +25,7 @@ type Feed struct {
 	Result *Result
 	Soft   *Soft
 	Trades *TradeBatch
+	Ticker *md.Ticker // latest-state ticker lane; independent of periodic Soft
 	// Every queued delivery reserves bytes until the receiver calls Release.
 	// Call Release on receipt, BEFORE any potentially slow network write.
 	reservation *feedReservation
@@ -60,6 +61,7 @@ const (
 	subscriptionAll subscriptionKind = iota
 	subscriptionBook
 	subscriptionTrades
+	subscriptionTicker
 )
 
 type subscriber struct {
@@ -94,11 +96,12 @@ func (s *Subscription) Close() {
 }
 
 type marketHub struct {
-	market   marketregistry.Market
-	sequence uint64 // written only by this market's run goroutine
-	head     uint64 // protected by Hub.mu
-	subs     map[*subscriber]struct{}
-	cancel   context.CancelFunc
+	market         marketregistry.Market
+	sequence       uint64 // written only by this market's run goroutine
+	tickerSequence uint64 // last PG-consistent ticker published by this worker
+	head           uint64 // protected by Hub.mu
+	subs           map[*subscriber]struct{}
+	cancel         context.CancelFunc
 }
 
 type Hub struct {
@@ -174,6 +177,16 @@ func (h *Hub) SubscribeBook(ctx context.Context, m marketregistry.Market) (*Subs
 	return h.admit(ctx, m, subscriptionBook)
 }
 
+// SubscribeTicker shares the market worker but uses a SINGLE pending latest
+// ticker slot. Superseded values may be replaced, never reordered. This lane
+// never queues order-book/trade results or the periodic WebSocket Soft feed.
+func (h *Hub) SubscribeTicker(ctx context.Context, m marketregistry.Market) (*Subscription, error) {
+	if _, ok := h.source.(TickerSource); !ok {
+		return nil, errors.New("stream: ticker source unavailable")
+	}
+	return h.admit(ctx, m, subscriptionTicker)
+}
+
 // SubscribeTrades does not queue non-trading matching results, candles,
 // book deltas, or ticker refreshes. Hub's journal worker still verifies all
 // sequences before publishing any trade batch.
@@ -238,7 +251,11 @@ func (h *Hub) subscribe(ctx context.Context, m marketregistry.Market, kind subsc
 			}
 			h.mu.Unlock()
 		}
-		sub := &subscriber{ch: make(chan Feed, h.queue), errs: make(chan error, 1), kind: kind}
+		queueSize := h.queue
+		if kind == subscriptionTicker {
+			queueSize = 1 // latest state replaces stale buffered state
+		}
+		sub := &subscriber{ch: make(chan Feed, queueSize), errs: make(chan error, 1), kind: kind}
 		h.mu.Lock()
 		if h.closed || h.parent.Err() != nil {
 			h.mu.Unlock()
@@ -278,7 +295,13 @@ func (h *Hub) broadcast(state *marketHub, feed Feed) {
 	for s := range state.subs {
 		outgoing := feed
 		var bytes int64
-		if s.kind == subscriptionBook {
+		if s.kind == subscriptionTicker {
+			if feed.Ticker == nil {
+				continue
+			}
+			outgoing = Feed{Ticker: feed.Ticker}
+			bytes = int64(proto.Size(feed.Ticker))
+		} else if s.kind == subscriptionBook {
 			if feed.Result == nil {
 				continue
 			}
@@ -308,6 +331,9 @@ func (h *Hub) broadcast(state *marketHub, feed Feed) {
 			}
 			outgoing = Feed{Trades: &TradeBatch{MarketSequence: feed.Result.Delta.GetMarketSequence(), Trades: feed.Result.Trades}}
 		} else {
+			if feed.Ticker != nil { // dedicated Connect ticker, not WebSocket soft
+				continue
+			}
 			var err error
 			if feed.Result != nil {
 				bytes, err = resultBytes(*feed.Result)
@@ -327,6 +353,17 @@ func (h *Hub) broadcast(state *marketHub, feed Feed) {
 		if bytes > MaxFeedBytes {
 			h.dropSubscriber(state, s, ErrPayloadTooLarge)
 			continue
+		}
+		if s.kind == subscriptionTicker {
+			// Only the pending (not currently writing) value is replaceable.
+			// Release its byte credits BEFORE reserving the newer value.
+			select {
+			case old := <-s.ch:
+				if old.reservation != nil {
+					old.reservation.releaseLocked()
+				}
+			default:
+			}
 		}
 		if s.queuedBytes+bytes > MaxSubscriberBytes || h.queuedBytes+bytes > h.maxTotalQueuedBytes {
 			h.dropSubscriber(state, s, ErrSlowConsumer)
@@ -371,6 +408,70 @@ func (h *Hub) dropSubscriber(state *marketHub, sub *subscriber, err error) {
 	}
 	h.drainQueued(sub)
 	delete(state.subs, sub)
+}
+
+// A ticker read failure is isolated to ticker consumers: it must not
+// invalidate the book/trade journal subscribers sharing the market worker.
+func (h *Hub) failTicker(state *marketHub, err error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.markets[state.market.SourceID] != state {
+		return
+	}
+	for s := range state.subs {
+		if s.kind == subscriptionTicker {
+			h.dropSubscriber(state, s, err)
+		}
+	}
+	if len(state.subs) == 0 {
+		delete(h.markets, state.market.SourceID)
+		state.cancel()
+	}
+}
+
+// refreshTicker is driven by the FAST journal poll cadence, not softEvery.
+// Each market issues at most one coherent PG ticker read per poll regardless
+// of its subscriber count. A ticker is a replaceable latest-state observation,
+// so gaps are expected, but regression/corruption terminates ticker streams.
+func (h *Hub) refreshTicker(ctx context.Context, state *marketHub) {
+	h.mu.Lock()
+	needed := false
+	if h.markets[state.market.SourceID] == state {
+		for s := range state.subs {
+			if s.kind == subscriptionTicker {
+				needed = true
+				break
+			}
+		}
+	}
+	h.mu.Unlock()
+	if !needed {
+		return
+	}
+	reader := h.source.(TickerSource) // SubscribeTicker verified capability
+	readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	ticker, err := reader.LatestTicker(readCtx, state.market)
+	cancel()
+	if ctx.Err() != nil {
+		return
+	}
+	if err == nil {
+		err = validateStreamTicker(ticker, state.market)
+	}
+	if err != nil {
+		h.failTicker(state, err)
+		return
+	}
+	seq := ticker.GetMarketSequence()
+	if seq < state.tickerSequence {
+		h.failTicker(state, ErrSequenceGap)
+		return
+	}
+	if seq == state.tickerSequence {
+		return
+	}
+	state.tickerSequence = seq
+	h.broadcast(state, Feed{Ticker: ticker})
 }
 
 func (h *Hub) fail(state *marketHub, err error) {
@@ -431,6 +532,12 @@ func (h *Hub) run(ctx context.Context, state *marketHub) {
 		case <-ctx.Done():
 			return
 		case <-poll.C:
+			// Ticker latest-state updates do not wait for journal catch-up or
+			// the slower periodic WebSocket soft refresh. Read once per market.
+			h.refreshTicker(ctx, state)
+			if ctx.Err() != nil {
+				return
+			}
 			// Drain a limited number of full batches per tick, preserving the
 			// exact sequence. No backpressure policy ever skips durable events.
 			for batch := 0; batch < h.policy.MaxPollBatches; batch++ {

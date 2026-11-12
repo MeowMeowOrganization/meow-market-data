@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CEX 23.7: real service, real Kafka, PostgreSQL, Redis, Connect, WebSocket.
+# CEX 26.5: real Kafka/PG/Redis, three Connect streams, WebSocket and restart recovery.
 # Run from anywhere: bash scripts/e2e.sh
 set -Eeuo pipefail
 
@@ -22,21 +22,49 @@ TOPIC="matching.results.cex237.${ID//_/.}"
 GROUP="meow-md-e2e-${ID}"
 TMP="$(mktemp -d)"
 SERVICE_PID=''
+CHECKER_PID=''
 CREATED_DB=0
 CREATED_TOPIC=0
 KEEP_E2E="${KEEP_E2E:-0}"
 
+# SIGTERM must finish the coordinated CEX 26.2 shutdown before the hard
+# deadline. SIGKILL is a test FAILURE, never a successful recovery mechanism.
 stop_service() {
-  if [[ -n "$SERVICE_PID" ]]; then
-    kill "$SERVICE_PID" 2>/dev/null || true
-    wait "$SERVICE_PID" 2>/dev/null || true
-    SERVICE_PID=''
+  if [[ -z "$SERVICE_PID" ]]; then return 0; fi
+  local pid="$SERVICE_PID"
+  SERVICE_PID=''
+  if ! kill -0 "$pid" 2>/dev/null; then
+    wait "$pid" || { echo 'market-data exited unexpectedly before SIGTERM' >&2; return 1; }
+    return 0
   fi
+  kill -TERM "$pid"
+  local stopped=0
+  for ((i=0;i<75;i++)); do
+    if ! kill -0 "$pid" 2>/dev/null; then stopped=1; break; fi
+    sleep 0.2
+  done
+  if [[ "$stopped" -ne 1 ]]; then
+    echo 'FAIL: market-data did not finish coordinated shutdown within 15s' >&2
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    return 1
+  fi
+  if ! wait "$pid"; then
+    echo 'FAIL: market-data exited nonzero after SIGTERM' >&2
+    return 1
+  fi
+  echo 'PASS: market-data SIGTERM joined all streaming and background workers'
 }
+
 cleanup() {
   code=$?
   trap - EXIT
-  stop_service
+  if [[ -n "$CHECKER_PID" ]]; then
+    kill "$CHECKER_PID" 2>/dev/null || true
+    wait "$CHECKER_PID" 2>/dev/null || true
+    CHECKER_PID=''
+  fi
+  stop_service || code=1
   if [[ $code -ne 0 ]]; then
     echo '--- market-data service log (tail) ---' >&2
     tail -n 120 "$TMP/service.log" 2>/dev/null >&2 || true
@@ -99,6 +127,14 @@ export MARKET_DATA_PUBLIC_ALLOWED_ORIGINS='http://localhost:5173'
 export MARKET_DATA_HTTP_MAX_WS_CONNECTIONS='16'
 export MARKET_DATA_STREAM_POLL_INTERVAL='100ms'
 export MARKET_DATA_STREAM_SOFT_INTERVAL='2s'
+# Keep the strict CEX 26.2 stale-stream policy explicitly enabled. Server
+# disconnect/reconnect is the deterministic resilience probe below.
+export MARKET_DATA_STREAM_MAX_HEAD_LAG_SEQUENCES='2048'
+export MARKET_DATA_STREAM_MAX_HEAD_LAG_AGE='3s'
+export MARKET_DATA_STREAM_MAX_POLL_BATCHES='4'
+export MARKET_DATA_HTTP_MAX_BOOK_RPC_STREAMS='16'
+export MARKET_DATA_HTTP_MAX_TRADE_RPC_STREAMS='16'
+export MARKET_DATA_HTTP_MAX_TICKER_RPC_STREAMS='16'
 
 start_service() {
   "$TMP/market-data" > "$TMP/service.log" 2>&1 &
@@ -139,4 +175,41 @@ echo '=== Phase 4: Redis restarted -> automatic cache reconstruction ==='
 "${COMPOSE[@]}" up -d --wait redis-e2e
 "$TMP/e2e-check" --phase restored "${common[@]}"
 
-echo 'PASS CEX 24.3: incremental projection, rolling statistics, outage fallback and Redis recovery'
+echo '=== Phase 5: three Connect streams, book deltas, mid-sequence trade replay, coalesced ticker ==='
+"$TMP/e2e-check" --phase streams "${common[@]}"
+
+echo '=== Phase 6: terminate backend with all three Connect streams active ==='
+"$TMP/e2e-check" --phase disconnect --ready-file "$TMP/streams.ready" \
+  --stop-file "$TMP/stop.requested" "${common[@]}" > "$TMP/disconnect.log" 2>&1 &
+CHECKER_PID=$!
+READY=0
+for ((i=0;i<150;i++)); do
+  if [[ -s "$TMP/streams.ready" ]]; then READY=1; break; fi
+  if ! kill -0 "$CHECKER_PID" 2>/dev/null; then
+    echo 'FAIL: stream disconnect checker exited before readiness' >&2
+    cat "$TMP/disconnect.log" >&2
+    exit 1
+  fi
+  sleep 0.2
+done
+if [[ "$READY" -ne 1 ]]; then
+  echo 'FAIL: all three Connect subscriptions were not established within 30s' >&2
+  cat "$TMP/disconnect.log" >&2
+  exit 1
+fi
+printf 'SIGTERM issued\n' > "$TMP/stop.requested"
+stop_service
+if ! wait "$CHECKER_PID"; then
+  echo 'FAIL: not all three Connect subscriptions observed backend disconnect' >&2
+  cat "$TMP/disconnect.log" >&2
+  CHECKER_PID=''
+  exit 1
+fi
+CHECKER_PID=''
+cat "$TMP/disconnect.log"
+
+echo '=== Phase 7: restart backend, verify fresh book/ticker and durable mid-sequence trade replay ==='
+start_service
+"$TMP/e2e-check" --phase reconnected "${common[@]}"
+
+echo 'PASS CEX 26.5: Kafka -> PG -> Redis, WebSocket, all Connect streams, exact replay, graceful shutdown and reconnect'

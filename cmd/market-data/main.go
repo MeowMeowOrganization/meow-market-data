@@ -119,6 +119,11 @@ func run(logger *slog.Logger) (runErr error) {
 		return err
 	}
 	rpc.TradeStream = tradeRPC
+	tickerRPC, err := stream.NewTickerRPC(registry, hub, cfg.MaxTickerRPCStreams)
+	if err != nil {
+		return err
+	}
+	rpc.TickerStream = tickerRPC
 	monitor := kafka.NewSourceMonitor(db, cfg.Topic)
 	mux := http.NewServeMux()
 	prefix, connectHandler := apiv1alpha1connect.NewMarketDataServiceHandler(rpc, connect.WithReadMaxBytes(64<<10), connect.WithSendMaxBytes(4<<20))
@@ -166,6 +171,7 @@ func run(logger *slog.Logger) (runErr error) {
 		}{
 			{"book RPC", bookRPC.ShutdownAndWait},
 			{"trade RPC", tradeRPC.ShutdownAndWait},
+			{"ticker RPC", tickerRPC.ShutdownAndWait},
 			{"WebSocket", wsHandler.ShutdownAndWait},
 			{"hub", hub.Shutdown},
 		}

@@ -30,6 +30,7 @@ type Config struct {
 	MaxWSConnections          int
 	MaxBookRPCStreams         int
 	MaxTradeRPCStreams        int
+	MaxTickerRPCStreams       int
 	StreamPollInterval        time.Duration
 	StreamSoftInterval        time.Duration
 	StreamMaxHeadLagSequences uint64
@@ -91,6 +92,14 @@ func LoadFromEnvironment() (Config, error) {
 			return cfg, errors.New("bootstrap: invalid maximum Connect trade streams")
 		}
 		cfg.MaxTradeRPCStreams = n
+	}
+	cfg.MaxTickerRPCStreams = 256
+	if v := os.Getenv("MARKET_DATA_HTTP_MAX_TICKER_RPC_STREAMS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 10000 {
+			return cfg, errors.New("bootstrap: invalid maximum Connect ticker streams")
+		}
+		cfg.MaxTickerRPCStreams = n
 	}
 	cfg.StreamPollInterval = 250 * time.Millisecond
 	cfg.StreamSoftInterval = 5 * time.Second

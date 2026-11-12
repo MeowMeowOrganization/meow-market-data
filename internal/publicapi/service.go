@@ -29,6 +29,7 @@ type Service struct {
 	Queries      Queries
 	BookStream   *stream.BookRPC
 	TradeStream  *stream.TradeRPC
+	TickerStream *stream.TickerRPC
 	CursorSecret []byte
 	Clock        func() time.Time
 }

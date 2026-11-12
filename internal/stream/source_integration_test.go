@@ -82,10 +82,22 @@ func TestDurableBookTradesCandleJournalAndReplayFloor(t *testing.T) {
 	if _, err = worker.Process(ctx, makeInput(1, 1, orderv1.OrderSide_ORDER_SIDE_SELL, false)); err != nil {
 		t.Fatal(err)
 	}
+	// Before the first execution the ticker has NO last price. The resting
+	// ask must still be read from the coherent durable book snapshot.
+	source := &PostgresSource{DB: db, Topic: topic}
+	before, err := source.LatestTicker(ctx, m)
+	if err != nil || before.GetMarketSequence() != 1 || before.LastPriceUnits != nil ||
+		before.BestAskPriceUnits == nil || before.GetUpdatedAt() == nil {
+		t.Fatalf("pre-trade durable ticker: %+v %v", before, err)
+	}
 	if _, err = worker.Process(ctx, makeInput(2, 2, orderv1.OrderSide_ORDER_SIDE_BUY, true)); err != nil {
 		t.Fatal(err)
 	}
-	source := &PostgresSource{DB: db, Topic: topic}
+	current, err := source.LatestTicker(ctx, m)
+	if err != nil || current.GetMarketSequence() != 2 || current.GetLastPriceUnits() != 2500 ||
+		!current.GetUpdatedAt().AsTime().Equal(timestamp) {
+		t.Fatalf("committed trade ticker must be coherent: %+v %v", current, err)
+	}
 	snap, err := source.Snapshot(ctx, m)
 	if err != nil || snap.GetMarketSequence() != 2 {
 		t.Fatalf("snapshot: %+v %v", snap, err)
