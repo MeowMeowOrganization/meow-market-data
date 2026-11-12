@@ -38,6 +38,7 @@ type Soft struct {
 
 type Source interface {
 	Snapshot(context.Context, marketregistry.Market) (*md.BookSnapshot, error)
+	Head(context.Context, marketregistry.Market) (uint64, error)
 	ReplayFloor(context.Context, marketregistry.Market) (uint64, error)
 	Results(context.Context, marketregistry.Market, uint64, uint64, int) ([]Result, error)
 	Current(context.Context, marketregistry.Market, time.Time) (*Soft, error)
@@ -61,12 +62,16 @@ func (s *PostgresSource) Snapshot(ctx context.Context, m marketregistry.Market) 
 		return nil, err
 	}
 	var b []byte
-	err := s.DB.QueryRowContext(ctx, `SELECT snapshot FROM market_data.public_books WHERE topic=$1 AND source_market_id=$2`, s.Topic, int64(m.SourceID)).Scan(&b)
+	err := s.DB.QueryRowContext(ctx, `SELECT CASE WHEN octet_length(snapshot) <= $3 THEN snapshot ELSE NULL END
+        FROM market_data.public_books WHERE topic=$1 AND source_market_id=$2`, s.Topic, int64(m.SourceID), MaxSnapshotBytes).Scan(&b)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotReady
 	}
 	if err != nil {
 		return nil, err
+	}
+	if b == nil {
+		return nil, ErrPayloadTooLarge
 	}
 	snap := new(md.BookSnapshot)
 	if err := proto.Unmarshal(b, snap); err != nil {
@@ -77,6 +82,29 @@ func (s *PostgresSource) Snapshot(ctx context.Context, m marketregistry.Market) 
 	}
 	return snap, nil
 }
+
+// Head reads only the authoritative durable book cursor. A cache-derived
+// cursor is not safe for detecting divergence or estimating live lag.
+func (s *PostgresSource) Head(ctx context.Context, m marketregistry.Market) (uint64, error) {
+	if err := s.check(); err != nil {
+		return 0, err
+	}
+	var raw string
+	err := s.DB.QueryRowContext(ctx, `SELECT market_sequence::text FROM market_data.public_books
+        WHERE topic=$1 AND source_market_id=$2`, s.Topic, int64(m.SourceID)).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrNotReady
+	}
+	if err != nil {
+		return 0, err
+	}
+	seq, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil || seq == 0 {
+		return 0, ErrSequenceGap
+	}
+	return seq, nil
+}
+
 func (s *PostgresSource) ReplayFloor(ctx context.Context, m marketregistry.Market) (uint64, error) {
 	if err := s.check(); err != nil {
 		return 0, err
@@ -113,18 +141,28 @@ func (s *PostgresSource) Results(ctx context.Context, m marketregistry.Market, a
 	defer tx.Rollback()
 	// Compare as NUMERIC, not int64, to preserve the whole uint64 domain.
 	lower, upper := strconv.FormatUint(after, 10), strconv.FormatUint(through, 10)
-	rows, err := tx.QueryContext(ctx, `SELECT market_sequence::text,payload FROM market_data.book_deltas
+	rows, err := tx.QueryContext(ctx, `SELECT market_sequence::text,CASE WHEN octet_length(payload) <= $6 THEN payload ELSE NULL END FROM market_data.book_deltas
         WHERE topic=$1 AND source_market_id=$2 AND market_sequence>$3
           AND ($4::numeric=0 OR market_sequence<=$4)
-        ORDER BY market_sequence ASC LIMIT $5`, s.Topic, int64(m.SourceID), lower, upper, limit)
+        ORDER BY market_sequence ASC LIMIT $5`, s.Topic, int64(m.SourceID), lower, upper, limit, MaxFeedBytes)
 	if err != nil {
 		return nil, err
 	}
 	var out []Result
+	var batchBytes int64
 	for rows.Next() {
 		var seqString string
 		var raw []byte
 		if err = rows.Scan(&seqString, &raw); err != nil {
+			break
+		}
+		if raw == nil {
+			err = ErrPayloadTooLarge
+			break
+		}
+		batchBytes += int64(len(raw))
+		if batchBytes > MaxJournalBatchBytes {
+			err = ErrBatchTooLarge
 			break
 		}
 		seq, parseErr := strconv.ParseUint(seqString, 10, 64)
@@ -171,16 +209,31 @@ func (s *PostgresSource) Results(ctx context.Context, m marketregistry.Market, a
 	for i, v := range out {
 		bySeq[v.Delta.GetMarketSequence()] = i
 	}
-	trades, err := tx.QueryContext(ctx, `SELECT market_sequence::text,payload FROM market_data.public_trades
+	trades, err := tx.QueryContext(ctx, `SELECT market_sequence::text,CASE WHEN octet_length(payload) <= $5 THEN payload ELSE NULL END FROM market_data.public_trades
         WHERE topic=$1 AND source_market_id=$2 AND market_sequence >= $3 AND market_sequence <= $4
-        ORDER BY market_sequence,event_ordinal`, s.Topic, int64(m.SourceID), low, highest)
+        ORDER BY market_sequence,event_ordinal LIMIT $6`, s.Topic, int64(m.SourceID), low, highest, MaxFeedBytes, MaxJournalRows+1)
 	if err != nil {
 		return nil, err
 	}
+	var tradeRows int
 	for trades.Next() {
+		tradeRows++
+		if tradeRows > MaxJournalRows {
+			err = ErrBatchTooLarge
+			break
+		}
 		var seqString string
 		var b []byte
 		if err = trades.Scan(&seqString, &b); err != nil {
+			break
+		}
+		if b == nil {
+			err = ErrPayloadTooLarge
+			break
+		}
+		batchBytes += int64(len(b))
+		if batchBytes > MaxJournalBatchBytes {
+			err = ErrBatchTooLarge
 			break
 		}
 		seq, parseErr := strconv.ParseUint(seqString, 10, 64)
@@ -202,6 +255,9 @@ func (s *PostgresSource) Results(ctx context.Context, m marketregistry.Market, a
 			break
 		}
 		out[idx].Trades = append(out[idx].Trades, tr)
+		if _, err = resultBytes(out[idx]); err != nil {
+			break
+		}
 	}
 	if err == nil {
 		err = trades.Err()
@@ -210,16 +266,31 @@ func (s *PostgresSource) Results(ctx context.Context, m marketregistry.Market, a
 	if err != nil {
 		return nil, err
 	}
-	candles, err := tx.QueryContext(ctx, `SELECT market_sequence::text,payload FROM market_data.candle_updates
+	candles, err := tx.QueryContext(ctx, `SELECT market_sequence::text,CASE WHEN octet_length(payload) <= $5 THEN payload ELSE NULL END FROM market_data.candle_updates
         WHERE topic=$1 AND source_market_id=$2 AND market_sequence >= $3 AND market_sequence <= $4
-        ORDER BY market_sequence,interval_id,start_ns`, s.Topic, int64(m.SourceID), low, highest)
+        ORDER BY market_sequence,interval_id,start_ns LIMIT $6`, s.Topic, int64(m.SourceID), low, highest, MaxFeedBytes, MaxJournalRows+1)
 	if err != nil {
 		return nil, err
 	}
+	var candleRows int
 	for candles.Next() {
+		candleRows++
+		if candleRows > MaxJournalRows {
+			err = ErrBatchTooLarge
+			break
+		}
 		var seqString string
 		var b []byte
 		if err = candles.Scan(&seqString, &b); err != nil {
+			break
+		}
+		if b == nil {
+			err = ErrPayloadTooLarge
+			break
+		}
+		batchBytes += int64(len(b))
+		if batchBytes > MaxJournalBatchBytes {
+			err = ErrBatchTooLarge
 			break
 		}
 		seq, parseErr := strconv.ParseUint(seqString, 10, 64)
@@ -241,6 +312,9 @@ func (s *PostgresSource) Results(ctx context.Context, m marketregistry.Market, a
 			break
 		}
 		out[idx].Candles = append(out[idx].Candles, c)
+		if _, err = resultBytes(out[idx]); err != nil {
+			break
+		}
 	}
 	if err == nil {
 		err = candles.Err()

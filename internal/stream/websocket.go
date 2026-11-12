@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	md "github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/marketdata/v1alpha1"
@@ -33,6 +34,10 @@ type Handler struct {
 	Shutdown       <-chan struct{} // application cancellation, including hijacked WS connections
 	AllowedOrigins []string
 	connections    chan struct{}
+	mu             sync.Mutex
+	active         map[*websocket.Conn]struct{}
+	closed         bool
+	done           chan struct{}
 }
 
 func NewHandler(registry *marketregistry.Registry, source Source, hub *Hub, origins []string, maxConnections int) (*Handler, error) {
@@ -45,8 +50,60 @@ func NewHandler(registry *marketregistry.Registry, source Source, hub *Hub, orig
 			return nil, fmt.Errorf("stream: invalid allowed origin %q", origin)
 		}
 	}
-	return &Handler{Registry: registry, Source: source, Hub: hub, AllowedOrigins: append([]string(nil), origins...), connections: make(chan struct{}, maxConnections)}, nil
+	return &Handler{Registry: registry, Source: source, Hub: hub, AllowedOrigins: append([]string(nil), origins...), connections: make(chan struct{}, maxConnections),
+		active: make(map[*websocket.Conn]struct{}), done: make(chan struct{})}, nil
 }
+
+// ShutdownAndWait actively closes hijacked WebSockets (net/http.Server.Shutdown
+// cannot see them), forbids new registration, and waits for their handlers to
+// unwind. Concurrent calls are safe and share the same completion channel.
+func (h *Handler) ShutdownAndWait(ctx context.Context) error {
+	h.mu.Lock()
+	if !h.closed {
+		h.closed = true
+		if len(h.active) == 0 {
+			close(h.done)
+		}
+	}
+	conns := make([]*websocket.Conn, 0, len(h.active))
+	for ws := range h.active {
+		conns = append(conns, ws)
+	}
+	done := h.done
+	h.mu.Unlock()
+	for _, ws := range conns {
+		_ = ws.Close()
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+func (h *Handler) register(ws *websocket.Conn) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return false
+	}
+	h.active[ws] = struct{}{}
+	return true
+}
+func (h *Handler) unregister(ws *websocket.Conn) {
+	h.mu.Lock()
+	delete(h.active, ws)
+	if h.closed && len(h.active) == 0 {
+		close(h.done)
+	}
+	h.mu.Unlock()
+}
+func (h *Handler) isClosed() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.closed
+}
+
 func (h *Handler) originOK(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
@@ -74,6 +131,10 @@ func (h *Handler) originOK(r *http.Request) bool {
 	return parsed.Scheme == "http"
 }
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.isClosed() {
+		http.Error(w, "market data shutting down", http.StatusServiceUnavailable)
+		return
+	}
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -132,7 +193,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Subscribe before reading the PG snapshot. Buffered hub messages can
 	// never vanish between snapshot acquisition and live delivery.
-	ctx := r.Context()
+	ctx, cancelStream := context.WithCancel(r.Context())
+	stopWithHub := context.AfterFunc(h.Hub.parent, cancelStream)
+	defer func() { stopWithHub(); cancelStream() }()
 	sub, err := h.Hub.Subscribe(ctx, m)
 	if err != nil {
 		http.Error(w, "market stream not ready", http.StatusServiceUnavailable)
@@ -154,7 +217,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	defer ws.Close()
+	if !h.register(ws) {
+		_ = ws.Close()
+		return
+	}
+	defer func() { _ = ws.Close(); h.unregister(ws) }()
 	ws.SetReadLimit(4096)
 	_ = ws.SetReadDeadline(time.Now().Add(pongWait))
 	ws.SetPongHandler(func(string) error { return ws.SetReadDeadline(time.Now().Add(pongWait)) })
@@ -174,7 +241,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	cursor := uint64(0)
 	canReplay := resume && version == m.DefinitionVersion && after <= snap.GetMarketSequence() &&
-		after >= floor-1 && snap.GetMarketSequence()-after <= maxReplay
+		after >= floor-1 && snap.GetMarketSequence()-after <= maxReplay && snap.GetMarketSequence()-after <= h.Hub.policy.MaxHeadSequences
 	if canReplay {
 		if err = h.writeControl(ws, map[string]any{"type": "ready", "mode": "replay", "marketId": m.Symbol,
 			"depth": depth, "marketDefinitionVersion": strconv.FormatUint(m.DefinitionVersion, 10),
@@ -182,15 +249,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		cursor = after
+		replayStart := time.Now()
 		for cursor < snap.GetMarketSequence() {
-			queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			results, e := h.Source.Results(queryCtx, m, cursor, snap.GetMarketSequence(), 256)
+			if time.Since(replayStart) >= h.Hub.policy.MaxBehind {
+				h.resync(ws)
+				return
+			}
+			queryCtx, cancel := context.WithTimeout(ctx, h.Hub.policy.MaxBehind-time.Since(replayStart))
+			results, _, e := boundedResults(queryCtx, h.Source, m, cursor, snap.GetMarketSequence(), 256)
 			cancel()
 			if e != nil || len(results) == 0 {
 				h.resync(ws)
 				return
 			}
 			for i := range results {
+				if _, e = resultBytes(results[i]); e != nil {
+					h.resync(ws)
+					return
+				}
 				if e = h.sendResult(ws, &cursor, results[i], channels); e != nil {
 					h.resync(ws)
 					return
@@ -228,6 +304,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	ping := time.NewTicker(pingEvery)
 	defer ping.Stop()
+	lagTick := time.NewTicker(h.Hub.pollEvery)
+	defer lagTick.Stop()
+	var behindSince time.Time
+	checkClientLag := func() error {
+		head := sub.ObservedHead()
+		if head < cursor {
+			head = cursor
+		}
+		return checkLag(cursor, head, time.Now(), &behindSince, h.Hub.policy)
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -236,11 +322,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-readErrors:
 			return
+		case <-lagTick.C:
+			if checkClientLag() != nil {
+				h.resync(ws)
+				return
+			}
 		case e := <-sub.Errors:
 			_ = e
 			h.resync(ws)
 			return
 		case msg := <-sub.Messages:
+			msg.Release() // return queued byte credits before writes
 			if msg.Result != nil {
 				if err = h.sendResult(ws, &cursor, *msg.Result, channels); err != nil {
 					h.resync(ws)
@@ -252,8 +344,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
+			if checkClientLag() != nil {
+				h.resync(ws)
+				return
+			}
 		case <-ping.C:
-			if err = ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeTimeout)); err != nil {
+			if err = ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(h.writeTimeout())); err != nil {
 				return
 			}
 		}
@@ -334,6 +430,12 @@ func (h *Handler) sendSoft(ws *websocket.Conn, soft *Soft, channels map[string]b
 	}
 	return nil
 }
+func (h *Handler) writeTimeout() time.Duration {
+	if h.Hub != nil && h.Hub.policy.MaxBehind < writeTimeout {
+		return h.Hub.policy.MaxBehind
+	}
+	return writeTimeout
+}
 func (h *Handler) writeUpdate(ws *websocket.Conn, v *md.MarketDataUpdate) error {
 	raw, err := protojson.Marshal(v)
 	if err != nil {
@@ -341,7 +443,10 @@ func (h *Handler) writeUpdate(ws *websocket.Conn, v *md.MarketDataUpdate) error 
 	}
 	payload := append([]byte(`{"type":"update","data":`), raw...)
 	payload = append(payload, '}')
-	if err := ws.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+	if len(payload) > MaxWebSocketBytes {
+		return ErrPayloadTooLarge
+	}
+	if err := ws.SetWriteDeadline(time.Now().Add(h.writeTimeout())); err != nil {
 		return err
 	}
 	return ws.WriteMessage(websocket.TextMessage, payload)
@@ -351,12 +456,15 @@ func (h *Handler) writeControl(ws *websocket.Conn, v any) error {
 	if err != nil {
 		return err
 	}
-	if err := ws.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+	if len(raw) > MaxWebSocketBytes {
+		return ErrPayloadTooLarge
+	}
+	if err := ws.SetWriteDeadline(time.Now().Add(h.writeTimeout())); err != nil {
 		return err
 	}
 	return ws.WriteMessage(websocket.TextMessage, raw)
 }
 func (h *Handler) resync(ws *websocket.Conn) {
-	_ = h.writeControl(ws, map[string]string{"type": "resync_required", "reason": "projection continuity or subscriber capacity lost"})
-	_ = ws.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseTryAgainLater, "resync required"), time.Now().Add(writeTimeout))
+	_ = h.writeControl(ws, map[string]string{"type": "resync_required", "reason": "projection continuity, stale lag, or subscriber capacity lost"})
+	_ = ws.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseTryAgainLater, "resync required"), time.Now().Add(h.writeTimeout()))
 }

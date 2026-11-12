@@ -15,23 +15,27 @@ import (
 )
 
 type Config struct {
-	DatabaseURL           string
-	Brokers               []string
-	Topic                 string
-	Group                 string
-	ClientID              string
-	RedisURL              string
-	RedisProjectionEpoch  string
-	RedisRefreshInterval  time.Duration
-	RedisBookPollInterval time.Duration
-	HTTPAddr              string
-	CursorSecret          string
-	AllowedOrigins        []string
-	MaxWSConnections      int
-	MaxBookRPCStreams     int
-	StreamPollInterval    time.Duration
-	StreamSoftInterval    time.Duration
-	Markets               []recovery.MarketConfig
+	DatabaseURL               string
+	Brokers                   []string
+	Topic                     string
+	Group                     string
+	ClientID                  string
+	RedisURL                  string
+	RedisProjectionEpoch      string
+	RedisRefreshInterval      time.Duration
+	RedisBookPollInterval     time.Duration
+	HTTPAddr                  string
+	CursorSecret              string
+	AllowedOrigins            []string
+	MaxWSConnections          int
+	MaxBookRPCStreams         int
+	MaxTradeRPCStreams        int
+	StreamPollInterval        time.Duration
+	StreamSoftInterval        time.Duration
+	StreamMaxHeadLagSequences uint64
+	StreamMaxHeadLagAge       time.Duration
+	StreamMaxPollBatches      int
+	Markets                   []recovery.MarketConfig
 }
 
 func LoadFromEnvironment() (Config, error) {
@@ -80,6 +84,14 @@ func LoadFromEnvironment() (Config, error) {
 		}
 		cfg.MaxBookRPCStreams = n
 	}
+	cfg.MaxTradeRPCStreams = 256
+	if v := os.Getenv("MARKET_DATA_HTTP_MAX_TRADE_RPC_STREAMS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 10000 {
+			return cfg, errors.New("bootstrap: invalid maximum Connect trade streams")
+		}
+		cfg.MaxTradeRPCStreams = n
+	}
 	cfg.StreamPollInterval = 250 * time.Millisecond
 	cfg.StreamSoftInterval = 5 * time.Second
 	if v := os.Getenv("MARKET_DATA_STREAM_POLL_INTERVAL"); v != "" {
@@ -95,6 +107,31 @@ func LoadFromEnvironment() (Config, error) {
 			return cfg, errors.New("bootstrap: stream soft interval must be >=1s")
 		}
 		cfg.StreamSoftInterval = d
+	}
+	// Strict, bounded head-lag policy. Both checks use the durable PG head.
+	cfg.StreamMaxHeadLagSequences = 2048
+	if v := os.Getenv("MARKET_DATA_STREAM_MAX_HEAD_LAG_SEQUENCES"); v != "" {
+		n, err := strconv.ParseUint(v, 10, 64)
+		if err != nil || n == 0 {
+			return cfg, errors.New("bootstrap: max head lag sequences must be positive uint64")
+		}
+		cfg.StreamMaxHeadLagSequences = n
+	}
+	cfg.StreamMaxHeadLagAge = 3 * time.Second
+	if v := os.Getenv("MARKET_DATA_STREAM_MAX_HEAD_LAG_AGE"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 100*time.Millisecond {
+			return cfg, errors.New("bootstrap: max head lag age must be >=100ms")
+		}
+		cfg.StreamMaxHeadLagAge = d
+	}
+	cfg.StreamMaxPollBatches = 4
+	if v := os.Getenv("MARKET_DATA_STREAM_MAX_POLL_BATCHES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 32 {
+			return cfg, errors.New("bootstrap: max poll batches must be 1..32")
+		}
+		cfg.StreamMaxPollBatches = n
 	}
 	if len(cfg.RedisProjectionEpoch) > 128 {
 		return cfg, errors.New("bootstrap: Redis projection epoch exceeds 128 bytes")

@@ -242,6 +242,7 @@ func TestHubBookOnlyFiltersSoftAndRetainsOnlyDelta(t *testing.T) {
 	hub.broadcast(state, Feed{Result: &Result{Delta: mkResult(2).Delta, Trades: []*md.TradeTick{{MarketId: "BTC-USDT"}}}})
 	select {
 	case got := <-sub.Messages:
+		got.Release()
 		if got.Result == nil || got.Result.Delta.GetMarketSequence() != 2 || got.Result.Trades != nil || got.Soft != nil {
 			t.Fatalf("book feed should contain only delta: %+v", got)
 		}

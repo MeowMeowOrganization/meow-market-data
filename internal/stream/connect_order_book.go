@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"connectrpc.com/connect"
 	api "github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/api/v1alpha1"
 	md "github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/marketdata/v1alpha1"
 	"github.com/MeowMeowOrganization/meow-market-data/internal/marketregistry"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -19,20 +21,26 @@ const (
 	bookHeartbeatInterval  = 20 * time.Second
 )
 
-// bookResponseControllerKey is set only by WithBookWriteDeadlines, which must
+// bookResponseControllerKey is set by WithStreamWriteDeadlines, which must
 // wrap the generated Connect handler. Deadline enforcement is not optional:
 // otherwise a peer that stops reading can block a stream.Send indefinitely.
 type bookResponseControllerKey struct{}
 
-// WithBookWriteDeadlines exposes the HTTP response controller to the RPC
+// WithStreamWriteDeadlines exposes the HTTP response controller to the RPC
 // method without changing Connect's generated interfaces. Do not wrap the
 // ResponseWriter with an unwrappable custom writer: ResponseController needs
 // the underlying HTTP/1 or HTTP/2 transport's SetWriteDeadline support.
-func WithBookWriteDeadlines(next http.Handler) http.Handler {
+func WithStreamWriteDeadlines(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := context.WithValue(r.Context(), bookResponseControllerKey{}, http.NewResponseController(w))
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// WithBookWriteDeadlines is retained for existing CEX26.1 clients/tests.
+// Both stream RPCs use the same HTTP/2 transport deadline middleware.
+func WithBookWriteDeadlines(next http.Handler) http.Handler {
+	return WithStreamWriteDeadlines(next)
 }
 
 // BookRPC is deliberately a small Connect adapter over the existing durable
@@ -45,14 +53,69 @@ type BookRPC struct {
 	capacity chan struct{}
 	// Set only by tests; production uses bookHeartbeatInterval.
 	heartbeatInterval time.Duration
+	mu                sync.Mutex
+	closed            bool
+	active            int
+	stopped           chan struct{}
+	stop              context.CancelFunc
+	life              context.Context
 }
 
 func NewBookRPC(registry *marketregistry.Registry, source Source, hub *Hub, maxConcurrent int) (*BookRPC, error) {
 	if registry == nil || source == nil || hub == nil || maxConcurrent < 1 || maxConcurrent > 10000 {
 		return nil, errors.New("stream: invalid Connect book stream configuration")
 	}
+	life, stop := context.WithCancel(hub.parent)
 	return &BookRPC{Registry: registry, Source: source, Hub: hub,
-		capacity: make(chan struct{}, maxConcurrent), heartbeatInterval: bookHeartbeatInterval}, nil
+		capacity: make(chan struct{}, maxConcurrent), heartbeatInterval: bookHeartbeatInterval,
+		life: life, stop: stop, stopped: make(chan struct{})}, nil
+}
+
+// ShutdownAndWait closes admission and waits for every accepted Connect stream
+// to release its hub subscription and capacity slot. A deadline lets the
+// caller force-close the HTTP server if a transport refuses to unblock.
+func (b *BookRPC) ShutdownAndWait(ctx context.Context) error {
+	b.mu.Lock()
+	if !b.closed {
+		b.closed = true
+		b.stop()
+		if b.active == 0 {
+			close(b.stopped)
+		}
+	}
+	done := b.stopped
+	b.mu.Unlock()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (b *BookRPC) enter() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed || b.life.Err() != nil {
+		return ErrStreamShutdown
+	}
+	select {
+	case b.capacity <- struct{}{}:
+		b.active++
+		return nil
+	default:
+		return ErrSlowConsumer
+	}
+}
+
+func (b *BookRPC) leave() {
+	b.mu.Lock()
+	<-b.capacity
+	b.active--
+	if b.closed && b.active == 0 {
+		close(b.stopped)
+	}
+	b.mu.Unlock()
 }
 
 func (b *BookRPC) StreamOrderBook(ctx context.Context, request *connect.Request[api.StreamOrderBookRequest], output *connect.ServerStream[api.StreamOrderBookResponse]) error {
@@ -70,14 +133,19 @@ func (b *BookRPC) StreamOrderBook(ctx context.Context, request *connect.Request[
 	if ctx.Err() != nil {
 		return bookRPCError(ctx.Err())
 	}
-	select {
-	case <-b.Hub.parent.Done():
-		return connect.NewError(connect.CodeUnavailable, errors.New("market data shutting down"))
-	case b.capacity <- struct{}{}:
-		defer func() { <-b.capacity }()
-	default:
-		return connect.NewError(connect.CodeResourceExhausted, errors.New("Connect book stream capacity exceeded"))
+	if err := b.enter(); err != nil {
+		if errors.Is(err, ErrSlowConsumer) {
+			return connect.NewError(connect.CodeResourceExhausted, errors.New("Connect book stream capacity exceeded"))
+		}
+		return bookRPCError(err)
 	}
+	defer b.leave()
+	// Cancel in-flight PostgreSQL reads and writers when shutdown starts,
+	// even if the client request remains open. HTTP send has its own deadline.
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	stopOnShutdown := context.AfterFunc(b.life, cancelStream)
+	defer func() { stopOnShutdown(); cancelStream() }()
+	ctx = streamCtx
 
 	// Subscribe before acquiring the snapshot; the bounded subscriber queue
 	// captures events committed while the snapshot query is in flight.
@@ -98,10 +166,13 @@ func (b *BookRPC) StreamOrderBook(ctx context.Context, request *connect.Request[
 	if err := validateBookSnapshot(snap, market); err != nil {
 		return bookRPCError(err)
 	}
+	if proto.Size(snap) > MaxSnapshotBytes {
+		return bookRPCError(ErrPayloadTooLarge)
+	}
 	cursor := snap.GetMarketSequence()
 	if err := sendBook(ctx, output, &api.StreamOrderBookResponse{
 		Event: &api.StreamOrderBookResponse_Snapshot{Snapshot: snap},
-	}); err != nil {
+	}, b.writeDeadline()); err != nil {
 		return bookRPCError(err)
 	}
 
@@ -109,6 +180,16 @@ func (b *BookRPC) StreamOrderBook(ctx context.Context, request *connect.Request[
 	// write deadline on idle books and make broken/half-open peers observable.
 	heartbeat := time.NewTicker(b.heartbeatInterval)
 	defer heartbeat.Stop()
+	lagTick := time.NewTicker(b.Hub.pollEvery)
+	defer lagTick.Stop()
+	var behindSince time.Time
+	checkClientLag := func() error {
+		head := sub.ObservedHead()
+		if head < cursor {
+			head = cursor
+		} // snapshot can precede hub's next poll
+		return checkLag(cursor, head, time.Now(), &behindSince, b.Hub.policy)
+	}
 	for {
 		// Prefer the terminal queue error over any already-buffered deltas.
 		// A lagging subscriber is never allowed to silently skip a sequence.
@@ -124,7 +205,12 @@ func (b *BookRPC) StreamOrderBook(ctx context.Context, request *connect.Request[
 			return connect.NewError(connect.CodeUnavailable, errors.New("market data shutting down"))
 		case err := <-sub.Errors:
 			return bookRPCError(err)
+		case <-lagTick.C:
+			if err := checkClientLag(); err != nil {
+				return bookRPCError(err)
+			}
 		case feed := <-sub.Messages:
+			feed.Release() // free queued-byte reservation before network I/O
 			if feed.Result == nil || feed.Result.Delta == nil {
 				return bookRPCError(ErrSequenceGap)
 			}
@@ -138,18 +224,24 @@ func (b *BookRPC) StreamOrderBook(ctx context.Context, request *connect.Request[
 				delta.GetMarketDefinitionVersion() != market.DefinitionVersion || delta.GetDepth() != market.Depth {
 				return bookRPCError(ErrSequenceGap)
 			}
+			if proto.Size(delta) > MaxFeedBytes {
+				return bookRPCError(ErrPayloadTooLarge)
+			}
 			if err := sendBook(ctx, output, &api.StreamOrderBookResponse{
 				Event: &api.StreamOrderBookResponse_Delta{Delta: delta},
-			}); err != nil {
+			}, b.writeDeadline()); err != nil {
 				return bookRPCError(err)
 			}
 			cursor = seq // advance only after successful send
+			if err := checkClientLag(); err != nil {
+				return bookRPCError(err)
+			}
 		case <-heartbeat.C:
 			if err := sendBook(ctx, output, &api.StreamOrderBookResponse{
 				Event: &api.StreamOrderBookResponse_Heartbeat{Heartbeat: &api.StreamOrderBookHeartbeat{
 					LastDeliveredMarketSequence: cursor,
 				}},
-			}); err != nil {
+			}, b.writeDeadline()); err != nil {
 				return bookRPCError(err)
 			}
 		}
@@ -167,12 +259,22 @@ func validateBookSnapshot(s *md.BookSnapshot, m marketregistry.Market) error {
 
 // sendBook enforces a per-write deadline without limiting the overall stream
 // lifetime. HTTP ResponseController is attached outside Connect's wrapper.
-func sendBook(ctx context.Context, output *connect.ServerStream[api.StreamOrderBookResponse], response *api.StreamOrderBookResponse) error {
+func (b *BookRPC) writeDeadline() time.Duration {
+	if b.Hub.policy.MaxBehind < bookSendTimeout {
+		return b.Hub.policy.MaxBehind
+	}
+	return bookSendTimeout
+}
+
+func sendBook(ctx context.Context, output *connect.ServerStream[api.StreamOrderBookResponse], response *api.StreamOrderBookResponse, timeout time.Duration) error {
 	rc, ok := ctx.Value(bookResponseControllerKey{}).(*http.ResponseController)
 	if !ok || rc == nil {
 		return errors.New("stream: write deadline middleware missing")
 	}
-	if err := rc.SetWriteDeadline(time.Now().Add(bookSendTimeout)); err != nil {
+	if proto.Size(response) > MaxSnapshotBytes {
+		return ErrPayloadTooLarge
+	}
+	if err := rc.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 		return fmt.Errorf("stream: unsupported write deadline transport: %w", err)
 	}
 	err := output.Send(response)
@@ -200,6 +302,12 @@ func bookRPCError(err error) error {
 		return connect.NewError(connect.CodeDeadlineExceeded, err)
 	case errors.Is(err, ErrSlowConsumer):
 		return connect.NewError(connect.CodeResourceExhausted, errors.New("slow book subscriber; reconnect for fresh snapshot"))
+	case errors.Is(err, ErrPayloadTooLarge):
+		return connect.NewError(connect.CodeResourceExhausted, errors.New("book payload exceeds stream byte limit"))
+	case errors.Is(err, ErrStreamShutdown):
+		return connect.NewError(connect.CodeUnavailable, errors.New("market data shutting down"))
+	case errors.Is(err, ErrStreamStale):
+		return connect.NewError(connect.CodeUnavailable, errors.New("book stream stale; reconnect for fresh snapshot"))
 	case errors.Is(err, ErrSequenceGap):
 		return connect.NewError(connect.CodeUnavailable, errors.New("book sequence continuity lost; reconnect for fresh snapshot"))
 	default:

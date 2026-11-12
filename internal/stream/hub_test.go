@@ -20,6 +20,15 @@ func (f *fakeSource) Snapshot(_ context.Context, m marketregistry.Market) (*md.B
 	return &md.BookSnapshot{MarketId: m.Symbol, SourceMarketId: m.SourceID, MarketSequence: f.snapshotSeq,
 		Depth: m.Depth, MarketDefinitionVersion: m.DefinitionVersion}, nil
 }
+func (f *fakeSource) Head(_ context.Context, _ marketregistry.Market) (uint64, error) {
+	head := f.snapshotSeq
+	for _, result := range f.committed {
+		if seq := result.Delta.GetMarketSequence(); seq > head {
+			head = seq
+		}
+	}
+	return head, nil
+}
 func (f *fakeSource) ReplayFloor(context.Context, marketregistry.Market) (uint64, error) {
 	if f.floor > 0 {
 		return f.floor, nil
@@ -66,6 +75,7 @@ func TestHubReplaysSequentialCommittedResults(t *testing.T) {
 	for seq := uint64(2); seq <= 3; seq++ {
 		select {
 		case m := <-sub.Messages:
+			m.Release()
 			if m.Result == nil || m.Result.Delta.GetMarketSequence() != seq {
 				t.Fatalf("expected sequence=%d, got %+v", seq, m)
 			}

@@ -28,6 +28,7 @@ type Service struct {
 	Registry     *marketregistry.Registry
 	Queries      Queries
 	BookStream   *stream.BookRPC
+	TradeStream  *stream.TradeRPC
 	CursorSecret []byte
 	Clock        func() time.Time
 }

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -34,7 +35,7 @@ func main() {
 		os.Exit(1)
 	}
 }
-func run(logger *slog.Logger) error {
+func run(logger *slog.Logger) (runErr error) {
 	cfg, err := bootstrap.LoadFromEnvironment()
 	if err != nil {
 		return err
@@ -94,7 +95,8 @@ func run(logger *slog.Logger) error {
 	defer cache.Close()
 
 	source := &stream.PostgresSource{DB: db, Topic: cfg.Topic, Cache: cache.Client, CacheNamespace: cache.Namespace}
-	hub, err := stream.NewHub(runCtx, source, cfg.StreamPollInterval, cfg.StreamSoftInterval, 256)
+	hub, err := stream.NewHubWithLagPolicy(runCtx, source, cfg.StreamPollInterval, cfg.StreamSoftInterval, 256,
+		stream.LagPolicy{MaxHeadSequences: cfg.StreamMaxHeadLagSequences, MaxBehind: cfg.StreamMaxHeadLagAge, MaxPollBatches: cfg.StreamMaxPollBatches})
 	if err != nil {
 		return err
 	}
@@ -112,12 +114,17 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	rpc.BookStream = bookRPC
+	tradeRPC, err := stream.NewTradeRPC(registry, source, hub, cfg.MaxTradeRPCStreams)
+	if err != nil {
+		return err
+	}
+	rpc.TradeStream = tradeRPC
 	monitor := kafka.NewSourceMonitor(db, cfg.Topic)
 	mux := http.NewServeMux()
 	prefix, connectHandler := apiv1alpha1connect.NewMarketDataServiceHandler(rpc, connect.WithReadMaxBytes(64<<10), connect.WithSendMaxBytes(4<<20))
 	// The response controller must refer to the ORIGINAL HTTP ResponseWriter;
 	// attach it before Connect's internal handler wrappers run.
-	mux.Handle(prefix, stream.WithBookWriteDeadlines(connectHandler))
+	mux.Handle(prefix, stream.WithStreamWriteDeadlines(connectHandler))
 	mux.Handle("/v1/market-data/stream", wsHandler)
 	mux.HandleFunc("/source-healthz", monitor.Handler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
@@ -136,7 +143,10 @@ func run(logger *slog.Logger) error {
 	}
 	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 120 * time.Second}
 	httpErrors := make(chan error, 1)
+	var background sync.WaitGroup
+	background.Add(1)
 	go func() {
+		defer background.Done()
 		e := server.Serve(listener)
 		if e != nil && !errors.Is(e, http.ErrServerClosed) {
 			httpErrors <- e
@@ -144,11 +154,42 @@ func run(logger *slog.Logger) error {
 		}
 	}()
 	defer func() {
-		cancelRun() // first, stop WS streams and the Kafka group
-		closeCtx, done := context.WithTimeout(context.Background(), 8*time.Second)
+		// Order matters: cancel producers first, then wait for every admitted
+		// RPC, hijacked WebSocket, hub worker and regular HTTP handler BEFORE
+		// closing PostgreSQL/Redis (deferred earlier in this function).
+		cancelRun()
+		closeCtx, done := context.WithTimeout(context.Background(), 15*time.Second)
 		defer done()
-		_ = server.Shutdown(closeCtx)
-		_ = server.Close()
+		steps := []struct {
+			name  string
+			close func(context.Context) error
+		}{
+			{"book RPC", bookRPC.ShutdownAndWait},
+			{"trade RPC", tradeRPC.ShutdownAndWait},
+			{"WebSocket", wsHandler.ShutdownAndWait},
+			{"hub", hub.Shutdown},
+		}
+		for _, step := range steps {
+			if e := step.close(closeCtx); e != nil {
+				logger.Error("stream shutdown not clean", "component", step.name, "error", e)
+				runErr = errors.Join(runErr, e)
+			}
+		}
+		if e := server.Shutdown(closeCtx); e != nil {
+			logger.Error("HTTP shutdown not clean", "error", e)
+			runErr = errors.Join(runErr, e)
+		}
+		// Always force-close any remaining sockets after graceful shutdown.
+		if e := server.Close(); e != nil {
+			runErr = errors.Join(runErr, e)
+		}
+		backgroundDone := make(chan struct{})
+		go func() { background.Wait(); close(backgroundDone) }()
+		select {
+		case <-backgroundDone:
+		case <-closeCtx.Done():
+			runErr = errors.Join(runErr, errors.New("background workers did not stop before deadline"))
+		}
 	}()
 
 	ids := make([]uint32, 0, len(cfg.Markets))
@@ -161,10 +202,13 @@ func run(logger *slog.Logger) error {
 		}
 		markets = append(markets, market)
 	}
+	background.Add(2)
 	go func() {
+		defer background.Done()
 		_ = readmodel.Run(runCtx, &readmodel.Reader{DB: db, Topic: cfg.Topic}, cache, ids, cfg.RedisRefreshInterval, logger)
 	}()
 	go func() {
+		defer background.Done()
 		projector := &livebook.Worker{
 			Journal: &livebook.PostgresJournal{DB: db, Topic: cfg.Topic},
 			Cache:   livebook.RedisAdapter{Cache: cache}, Markets: markets,
